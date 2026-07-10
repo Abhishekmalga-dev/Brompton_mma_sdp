@@ -1,0 +1,106 @@
+rows_written = staged_df.count()
+total_rows_written += rows_written
+
+print(f"[DEBUG] Wrote {rows_written} rows for survey={sname_lower} event_date={ev_str}")
+
+if sname_lower not in survey_report_stats:
+    survey_report_stats[sname_lower] = {"total_count": 0, "event_dates": set()}
+survey_report_stats[sname_lower]["total_count"] += rows_written
+survey_report_stats[sname_lower]["event_dates"].add(ev_str)
+
+staged_df.write.mode("overwrite").parquet(final_partition_path)
+
+-------
+
+#Add the report-building function — group with the other SNS helpers, right before SNS_SAFE_BYTES = 240 * 1024:
+
+def build_survey_summary_report(stats: dict) -> str:
+    """
+    Builds a plain-text, fixed-width tabular report of survey counts for this job run.
+    Used for both CloudWatch print() and the SNS summary email (both are plain text,
+    so Markdown-style tables won't render correctly in either).
+    """
+    if not stats:
+        return "No surveys were processed in this run.\n"
+
+    survey_col_width = max(
+        [len("Survey Name")] + [len(s) for s in stats.keys()] + [len("Total count in Feedback Manager")]
+    ) + 2
+    count_col_width = 15
+    date_col_width = 40
+
+    header = (
+        f"{'Survey Name':<{survey_col_width}}"
+        f"{'Total Count':<{count_col_width}}"
+        f"{'Event Date(s) Processed':<{date_col_width}}"
+    )
+    separator = "-" * (survey_col_width + count_col_width + date_col_width)
+
+    lines = [header, separator]
+
+    grand_total = 0
+    for sname in sorted(stats.keys()):
+        total_count = stats[sname]["total_count"]
+        event_dates = ", ".join(sorted(stats[sname]["event_dates"]))
+        grand_total += total_count
+        lines.append(
+            f"{sname:<{survey_col_width}}"
+            f"{total_count:<{count_col_width}}"
+            f"{event_dates:<{date_col_width}}"
+        )
+
+    lines.append(separator)
+    lines.append(
+        f"{'GRAND TOTAL (all surveys)':<{survey_col_width}}"
+        f"{grand_total:<{count_col_width}}"
+        f"{'':<{date_col_width}}"
+    )
+    lines.append(separator)
+    # Blank placeholder row - fill in manually after reconciling against Feedback Manager
+    lines.append(
+        f"{'Total count in Feedback Manager':<{survey_col_width}}"
+        f"{'':<{count_col_width}}"
+        f"{'':<{date_col_width}}"
+    )
+    lines.append(separator)
+
+    return "\n".join(lines)
+
+-------
+C#all it and wire into CloudWatch + SNS — inside the 
+# SNS SUMMARY section, right after summary is built and before send_sns_notification(...) is called:
+
+survey_report_text = build_survey_summary_report(survey_report_stats)
+
+print("\n=== SURVEY SUMMARY REPORT ===")
+print(survey_report_text)
+
+summary += "\n\nSurvey Summary Report:\n" + survey_report_text
+
+
+#Place these three lines right before the existing:
+
+send_sns_notification(ENV, subject, summary, is_failure=False)
+
+-------
+#Where: send_sns_notification() function definition.
+#Before:
+
+def send_sns_notification(env: str, subject: str, message: str, is_failure: bool = False):
+    if not is_failure and env != "dev":
+        return
+    try:
+        safe_message = truncate_message_for_sns(message, SNS_SAFE_BYTES)
+        sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=safe_message)
+    except Exception as e:
+        print(f"[ERROR] SNS publish failed: {e}")
+
+
+#After:
+
+def send_sns_notification(env: str, subject: str, message: str, is_failure: bool = False):
+    try:
+        safe_message = truncate_message_for_sns(message, SNS_SAFE_BYTES)
+        sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=safe_message)
+    except Exception as e:
+        print(f"[ERROR] SNS publish failed: {e}")
