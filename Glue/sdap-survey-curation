@@ -104,3 +104,108 @@ def send_sns_notification(env: str, subject: str, message: str, is_failure: bool
         sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=safe_message)
     except Exception as e:
         print(f"[ERROR] SNS publish failed: {e}")
+
+##7/18
+
+#before
+
+survey_report_stats = {}  # key: sname_lower -> {"total_count": int, "event_dates": set()}
+
+
+#next
+survey_daily_counts = []  # list of {"survey_name": ..., "event_date": ..., "row_count": ...} - one per (survey, event_date), feeds the Power BI reporting table
+
+----------------
+
+# Location 2 — Capture each daily count
+# Find this (inside the per-survey loop, right after rows_written = staged_df.count(), where you already added the survey_report_stats update, and right before staged_df.write.mode("overwrite").parquet(final_partition_path)):
+
+if sname_lower not in survey_report_stats:
+    survey_report_stats[sname_lower] = {"total_count": 0, "event_dates": set()}
+survey_report_stats[sname_lower]["total_count"] += rows_written
+survey_report_stats[sname_lower]["event_dates"].add(ev_str)
+
+# Add this right after it, still before staged_df.write...:
+
+survey_daily_counts.append({
+    "survey_name": sname_lower,
+    "event_date": ev_str,
+    "row_count": rows_written,
+})
+
+
+------------------
+
+# Location 3 — Add the new function
+# Find this (end of batch_level_dedup(), right before):
+
+SNS_SAFE_BYTES = 240 * 1024
+
+# NexAdd this new function directly above that line:
+
+def write_survey_daily_counts_report(daily_counts: list):
+    """
+    Writes one Parquet row per (survey_name, event_date) to a small reporting table
+    in the curated bucket, for Power BI / Athena / Starburst to query directly -
+    reuses the existing Athena/Glue Catalog BI stack instead of standing up new
+    DynamoDB + Athena federated-connector infra.
+
+    Each (survey, event_date) partition is fully overwritten, not merged/appended -
+    this is a summary count, not row-level survey data, so overwriting the whole
+    partition is correct and avoids double-counting on job re-runs.
+
+    NOTE: writes directly to each partition's exact path rather than using
+    df.write.partitionBy(...).mode("overwrite") with dynamic partitionOverwriteMode,
+    since that setting has proven unreliable in this environment elsewhere in this script.
+    """
+    if not daily_counts:
+        print("[REPORT] No survey daily counts to write for this run.")
+        return
+
+    report_schema = ["survey_name", "event_date", "row_count", "job_run_id", "env", "processed_ts"]
+
+    rows_with_meta = [
+        (
+            r["survey_name"],
+            r["event_date"],
+            r["row_count"],
+            job_run_id,
+            ENV,
+            datetime.utcnow().isoformat(),
+        )
+        for r in daily_counts
+    ]
+
+    report_df = spark.createDataFrame(rows_with_meta, schema=report_schema)
+
+    # One partition at a time - each (survey_name, event_date) combo gets its own
+    # folder, fully overwritten, so re-running a date never double-counts.
+    distinct_keys = {(r["survey_name"], r["event_date"]) for r in daily_counts}
+
+    for survey_name, event_date in distinct_keys:
+        partition_df = report_df.filter(
+            (col("survey_name") == survey_name) & (col("event_date") == event_date)
+        )
+
+        partition_path = (
+            f"s3://{CURATED_BUCKET}/ccaas/reporting/survey_daily_counts/"
+            f"survey_name={survey_name}/event_date={event_date}/"
+        )
+
+        print(f"[REPORT] Writing daily count report to {partition_path}")
+        partition_df.write.mode("overwrite").parquet(partition_path)
+
+
+------------
+
+
+# Location 4 — Call the function once per job run
+# Find this — the point right after your main loop:
+
+for ingest_date in ingest_dates_to_process:
+    ...
+
+    # Add this line there, on its own:
+
+write_survey_daily_counts_report(survey_daily_counts)
+
