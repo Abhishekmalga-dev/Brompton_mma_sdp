@@ -1,0 +1,16 @@
+Subject: Follow-Up: Export Column Updates, API vs Feedback Manager Data Discrepancy, and Date Range Clarification
+
+Hi Team,
+
+I have a few questions and follow-ups I wanted to raise:
+
+1. Last Updated Column & Total Rows Column: During our previous discussion with Sonali, we had requested if it would be possible to populate the 'Last Updated' column as well as a column indicating the total number of rows sent or transferred through the export. Could you please provide an update on whether this is feasible?
+
+2. Difference Between API Survey Data and Feedback Manager Survey Data: We would like to understand the difference between the survey data we receive through the API export and the data available in the Feedback Manager. When we compare the previous day's data between both sources, we are seeing a significant difference in the numbers. Could you help clarify what could be causing this discrepancy?
+
+3. Last 7 Days vs. Previous Week Date Range: In our current report, we have it configured to pull the last 7 days of data. However, this includes the current date, which means the data for today will constantly be refreshed and may not be stable. To avoid this, we explored the 'Previous Week' option, but noticed that it is returning data for the date range of 9th to 15th. Could you clarify how 'Previous Week' is being defined in this context, as we would expect it to cover the most recently completed calendar week?
+
+Please let us know at your earliest convenience.
+
+Thank you,
+Abhishek
