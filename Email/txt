@@ -1,1 +1,16 @@
-="SELECT DISTINCT '"&A1&"' AS column_name, CAST("""&A1&""" AS VARCHAR) AS distinct_value FROM ""datalake_dev"".""datalake_ccaas_dev"".""survey_customer_sat_iv"""&IF(A2<>""," UNION ALL",";")
+Subject: RE: NICE | Email Survey Technical Issues
+
+Hi ,
+
+Thank you for raising this concern.
+
+I want to provide some context on what was communicated on Friday. During my validation, I was checking whether verbatim data exists in the Data Lake for the Email survey — and I did confirm that verbatim records are present. However, I want to clarify that my review at that time was focused on verifying whether the verbatim fields were populated (i.e., not null), and I did not do a full date range analysis to confirm coverage across all recent months. I regret that I did not catch that the data was missing for the period post-April 5th during that review.
+
+Now that this has been brought to our attention, we are aware that the gap in Email survey records from April 5th onwards is tied to the open technical issue related to the System Separation activities, where customer support cases in DFO were opened with a PSEGLI no-reply email address instead of the customer's actual email address, causing surveys to not reach the intended recipients.
+
+We will ensure that any future validations include a complete date range check to avoid similar miscommunications going forward.
+
+Please let us know how you would like us to proceed from the Data Lake side once the upstream issue is investigated and resolved by the respective teams.
+
+Thank you,
+Abhishek
