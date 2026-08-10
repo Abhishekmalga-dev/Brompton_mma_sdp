@@ -209,3 +209,40 @@ for ingest_date in ingest_dates_to_process:
 
 write_survey_daily_counts_report(survey_daily_counts)
 
+------------
+
+# Add this near your other column-cleanup helpers (grouped with normalize_values(), strip_survey_prefixes()):
+
+def clean_intent_column(df):
+    """
+    Strips inconsistent ThankYou / -Thankyou / -ThankYou suffixes from the 'intent'
+    column, keeping only the base intent value.
+    e.g. "StartService-Thankyou" -> "StartService"
+         "BalanceBillingEnrollmentThankYou" -> "BalanceBillingEnrollment"
+         "ReportOutageNoLightSingleAccount-ThankYou" -> "ReportOutageNoLightSingleAccount"
+    Case-insensitive, works whether or not a hyphen separates the suffix.
+    Values with no such suffix (e.g. "ChangeRatePlan", "Rate Comparison") are untouched.
+    """
+    if "intent" not in df.columns:
+        return df
+
+    df = df.withColumn(
+        "intent",
+        when(
+            col("intent").isNotNull(),
+            regexp_replace(col("intent"), r"(?i)-?\s*thank\s*you\s*$", "")
+        ).otherwise(col("intent"))
+    )
+    return df
+
+# 2. Call it, right after your final column normalization completes
+
+# Find this (the last rename_columns_to_normalized(...) call, right after the df_norm.printSchema() debug print):
+
+df_norm = rename_columns_to_normalized(df_norm, RAW_TO_NORM)
+print("DEBUG: df_norm schema after normalization:")
+df_norm.printSchema()
+
+# Add this line directly after it:
+
+df_norm = clean_intent_column(df_norm)
