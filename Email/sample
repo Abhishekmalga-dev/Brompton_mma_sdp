@@ -1,0 +1,70 @@
+Context: I'm building a Snowflake data pipeline for the "wrapup_summary" project, following our team's established RAW -> WORK -> FINAL pattern. Generate 4 SQL scripts as described below. Follow our conventions: land raw data as VARIANT/VARCHAR first, use step markers for restartability, and use SP_APPLY_GRANT for standard grants at the end of DDL scripts.
+
+SOURCE JSON STRUCTURE (from Service Bus message, landed in raw table as VARIANT column named json_body):
+{
+  "conversation_id": string,
+  "summary": {
+    "inquiries": [
+      {
+        "member_id": string,
+        "member_suffix": string,
+        "member_name": string,
+        "inquiry_number": string,
+        "inquiry_role": string,
+        "inquiry_parent_number": string|null,
+        "classification": string,
+        "intents": [ { "id": number, "label": string } ],
+        "description": string,
+        "resolution": string,
+        "status": string,
+        "inquiry_summary": string,
+        "key_points": [ string ],
+        "topics_covered": [ string ]
+      }
+    ]
+  },
+  "generated_at": timestamp,
+  "model_version": string,
+  "token_usage": { "prompt_tokens": number, "completion_tokens": number, "total_tokens": number }
+}
+
+TARGET TABLE SHAPE (5 entities, 1 header : many-inquiries : many-intents/key_points/topics fan-out):
+1. conversation  - grain: 1 row per conversation_id. Columns: conversation_id (PK), message_id, sequence_number, generated_at, model_version, prompt_tokens, completion_tokens, total_tokens, updated_on
+2. inquiry        - grain: 1 row per inquiry. Columns: inquiry_id (deterministic surrogate PK - hash of conversation_id + array index, NOT random, so the value is reproducible across runs), conversation_id (FK), inquiry_number, inquiry_role, inquiry_parent_number, classification, description, resolution, status, inquiry_summary, updated_on
+   - Do NOT include member_id, member_suffix, or member_name columns on this table (removed per review feedback from Suraj on 7/31/2026 - these fields should not be persisted here).
+   - Include a MEME_CK column and make it NULLABLE (per Suraj's review feedback - confirm exact column name/definition against the existing ASDT_WRAPUP_SUMMARY DDL before finalizing, as this may already exist as a composite/check key column in the current schema).
+3. inquiry_intent - grain: 1 row per intent. Columns: inquiry_id (FK), intent_id, intent_label, updated_on
+4. inquiry_key_point - grain: 1 row per key point. Columns: inquiry_id (FK), key_point_seq, key_point_text, updated_on
+5. inquiry_topic  - grain: 1 row per topic. Columns: inquiry_id (FK), topic_seq, topic_text, updated_on
+
+TIMESTAMP REQUIREMENT: In the FINAL tables (asdt_ prefix) only, all timestamp columns (generated_at, updated_on, and any other date/time column) must be declared as TIMESTAMP_NTZ, and all values inserted into them must be explicitly cast with ::TIMESTAMP_NTZ (or TRY_TO_TIMESTAMP_NTZ where parsing from string/VARIANT). Work tables (asdw_ prefix) can retain the raw parsed type if it differs, but the final INSERT into the FINAL table must cast to TIMESTAMP_NTZ.
+
+NAMING CONVENTION (matches file naming pattern in our OneNote doc):
+- Work tables (prefix asdw_): asdw_wrapup_summary_conversation_load, asdw_wrapup_summary_inquiry_load, asdw_wrapup_summary_inquiry_intent_load, asdw_wrapup_summary_inquiry_key_point_load, asdw_wrapup_summary_inquiry_topic_load
+- Final tables (prefix asdt_): asdt_wrapup_summary_conversation, asdt_wrapup_summary_inquiry, asdt_wrapup_summary_inquiry_intent, asdt_wrapup_summary_inquiry_key_point, asdt_wrapup_summary_inquiry_topic
+- Raw table: assumed already created, referenced as asd_wrapup_summary_raw (adjust name if different in this repo)
+
+GENERATE THESE 4 FILES:
+
+File 1: asd_wrapup_summary_load_raw_table.sql
+- Loads the raw JSON payload from Blob storage into the raw table's VARIANT column via COPY INTO, following the same pattern as our other shared_snowSQL-based raw loads.
+
+File 2: asd_wrapup_summary_truncate_work_tables.sql
+- TRUNCATE TABLE statements for the 5 work tables listed above, in child-to-parent order (intents/key_points/topics first, then inquiry, then conversation) to avoid orphaned-looking state mid-run.
+
+File 3: asd_wrapup_summary_populate_work_tables.sql
+- INSERT INTO each of the 5 work tables, SELECTing from the raw table's json_body VARIANT column.
+- Use LATERAL FLATTEN to unnest summary:inquiries, then a nested LATERAL FLATTEN on each of intents, key_points, topics_covered within that same inquiry row.
+- Generate inquiry_id deterministically, e.g. HASH(conversation_id, inquiry_value.index) or MD5(conversation_id || '-' || inquiry_value.index::string), and reuse that same expression when populating inquiry_intent, inquiry_key_point, inquiry_topic so the FK lines up.
+- Do NOT select member_id, member_suffix, or member_name into the inquiry work table.
+- Cast all fields out of VARIANT explicitly (::STRING, ::NUMBER, etc.); do not leave typed columns as VARIANT.
+- Use TRY_TO_TIMESTAMP_NTZ for generated_at/enqueued_time_utc; note we use TRY_TO_DATE (not TRY_TO_TIMESTAMP_NTZ) for date-only columns elsewhere, but these are timestamps so TRY_TO_TIMESTAMP_NTZ is correct here.
+- Populate updated_on as CURRENT_TIMESTAMP()::TIMESTAMP_NTZ on every row.
+
+File 4: asd_wrapup_summary_load_final_tables.sql
+- For each of the 5 tables, trim trailing spaces on all string columns in the work table first (UPDATE work table SET col = RTRIM(col)).
+- Then INSERT INTO the final table SELECT * FROM the work table, explicitly casting any timestamp column to ::TIMESTAMP_NTZ, using an anti-join (LEFT JOIN final ON PK columns AND UPDATED_ON WHERE final.PK IS NULL) so that rows whose PK + UPDATED_ON combination already exists in the final table are skipped.
+- Do this in parent-to-child order (conversation, then inquiry, then intent/key_point/topic) since child FINAL tables reference inquiry_id from the parent.
+- PK for the anti-join purposes: conversation -> conversation_id; inquiry -> inquiry_id; inquiry_intent -> (inquiry_id, intent_id); inquiry_key_point -> (inquiry_id, key_point_seq); inquiry_topic -> (inquiry_id, topic_seq).
+
+Match the SQL style, comment headers, and step-marker/logging conventions used elsewhere in this repo (see shared_snowsql.py and existing *_load_final_tables.sql files as style reference).
