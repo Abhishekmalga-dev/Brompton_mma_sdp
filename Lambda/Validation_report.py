@@ -11,8 +11,16 @@ Athena, no query engine of any kind. Starburst only ever sees this
 pipeline's OUTPUT, via the Glue Crawler triggered at the end of this
 script; this script has zero awareness of Starburst.
 
-Requires a Lambda layer with `pyarrow` installed -- not in the default
-Lambda runtime.
+Parquet files are downloaded as raw bytes via boto3 and parsed in-memory
+with pyarrow.parquet -- deliberately NOT using pyarrow.fs.S3FileSystem,
+since that requires the pyarrow build to include optional S3/libcurl
+support, which isn't guaranteed present in every Lambda layer build
+(confirmed failure: "pyarrow installation is not built with support for
+'S3FileSystem'" on AWSSDKPandas-Python314). Downloading bytes via boto3
+and parsing with plain pyarrow.parquet avoids this dependency entirely.
+
+Requires a Lambda layer with `pyarrow` installed (e.g. AWSSDKPandas) --
+not in the default Lambda runtime.
 
 Trigger: EventBridge rule on the Sentiment-writing Step Function's
          "ExecutionSucceeded" event.
@@ -26,8 +34,8 @@ Backfill: invoke directly with {"event_date": "YYYY-MM-DD"} in the payload
 import boto3
 import json
 import logging
-import pyarrow.dataset as ds
-import pyarrow.fs as pafs
+import io
+import pyarrow.parquet as pq
 from datetime import datetime, timezone
 
 logger = logging.getLogger()
@@ -121,14 +129,14 @@ SURVEY_CONFIGS = [
 ]
 
 # Report storage
-S3_REPORT_BUCKET = "TODO-your-reconciliation-report-bucket-dev"
-S3_REPORT_PREFIX = "sentiment_analysis/reconciliation_reports"
+S3_REPORT_BUCKET = "psegli-datalakenonprodli-datalake-curated-dev"
+S3_REPORT_PREFIX = "ccaas/Survey_Reconciliation_Report"
 
-DYNAMODB_TABLE_NAME = "TODO-datalake-reconciliation-summary-dev"
+DYNAMODB_TABLE_NAME = "datalake-ccaas-reconciliation-dev"
 
 # Glue crawler that registers the S3 report output in the Data Catalog,
 # making it queryable in Starburst automatically.
-GLUE_CRAWLER_NAME = "TODO-datalake-reconciliation-report-crawler-dev"
+GLUE_CRAWLER_NAME = "datalake-reconciliation-report-dev"
 
 # =============================================================================
 # AWS CLIENTS
@@ -136,7 +144,6 @@ GLUE_CRAWLER_NAME = "TODO-datalake-reconciliation-report-crawler-dev"
 
 s3_client = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
-s3_filesystem = pafs.S3FileSystem()  # used by pyarrow for Parquet reads
 
 
 # =============================================================================
@@ -170,6 +177,31 @@ def get_max_event_date(bucket, prefix):
     return dates[-1] if dates else None
 
 
+def _list_parquet_keys(bucket, prefix):
+    """Lists all .parquet object keys under a given S3 prefix."""
+    paginator = s3_client.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".parquet"):
+                keys.append(obj["Key"])
+    return keys
+
+
+def _read_parquet_table(bucket, key, columns=None):
+    """
+    Downloads a single Parquet file's bytes via boto3 and parses it with
+    pyarrow from memory. Avoids pyarrow.fs.S3FileSystem entirely, which
+    requires the pyarrow build to include optional S3/libcurl support --
+    not guaranteed present in every Lambda layer build. boto3 always
+    supports plain object downloads, so this works regardless of how
+    pyarrow itself was compiled.
+    """
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    data = response["Body"].read()
+    return pq.read_table(io.BytesIO(data), columns=columns)
+
+
 def partition_has_data(bucket, prefix):
     """Checks whether a specific S3 prefix has any objects at all."""
     response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
@@ -177,33 +209,33 @@ def partition_has_data(bucket, prefix):
 
 
 def count_parquet_rows(bucket, prefix):
-    """
-    Counts total rows across all Parquet files under an S3 prefix, using
-    pyarrow's dataset API. This reads only file metadata/footers (via
-    range requests through S3FileSystem), NOT the actual row data --
-    efficient even for large partitions.
-    Returns 0 if the prefix has no data.
-    """
-    if not partition_has_data(bucket, prefix):
+    """Counts total rows across all Parquet files under an S3 prefix."""
+    keys = _list_parquet_keys(bucket, prefix)
+    if not keys:
         return 0
 
-    dataset = ds.dataset(f"{bucket}/{prefix}", filesystem=s3_filesystem, format="parquet")
-    return dataset.count_rows()
+    total = 0
+    for key in keys:
+        table = _read_parquet_table(bucket, key)
+        total += table.num_rows
+    return total
 
 
 def read_parquet_column(bucket, prefix, column_name):
     """
     Reads a single column from all Parquet files under an S3 prefix.
-    Used to pull contact_record_id sets for the anti-join, without
-    reading full rows -- pyarrow only fetches the requested column.
+    Used to pull contact_record_id sets for the anti-join.
     Returns an empty set if the prefix has no data.
     """
-    if not partition_has_data(bucket, prefix):
+    keys = _list_parquet_keys(bucket, prefix)
+    if not keys:
         return set()
 
-    dataset = ds.dataset(f"{bucket}/{prefix}", filesystem=s3_filesystem, format="parquet")
-    table = dataset.to_table(columns=[column_name])
-    return set(table.column(column_name).to_pylist())
+    values = set()
+    for key in keys:
+        table = _read_parquet_table(bucket, key, columns=[column_name])
+        values.update(table.column(column_name).to_pylist())
+    return values
 
 
 def read_parquet_columns_as_dict(bucket, prefix, key_column, value_column):
@@ -213,14 +245,17 @@ def read_parquet_columns_as_dict(bucket, prefix, key_column, value_column):
     build contact_record_id -> removal_reason lookups.
     Returns an empty dict if the prefix has no data.
     """
-    if not partition_has_data(bucket, prefix):
+    keys = _list_parquet_keys(bucket, prefix)
+    if not keys:
         return {}
 
-    dataset = ds.dataset(f"{bucket}/{prefix}", filesystem=s3_filesystem, format="parquet")
-    table = dataset.to_table(columns=[key_column, value_column])
-    keys = table.column(key_column).to_pylist()
-    values = table.column(value_column).to_pylist()
-    return dict(zip(keys, values))
+    result = {}
+    for key in keys:
+        table = _read_parquet_table(bucket, key, columns=[key_column, value_column])
+        ids = table.column(key_column).to_pylist()
+        vals = table.column(value_column).to_pylist()
+        result.update(dict(zip(ids, vals)))
+    return result
 
 
 def count_all_raw_survey_records(event_date):
