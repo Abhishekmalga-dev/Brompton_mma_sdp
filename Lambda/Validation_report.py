@@ -19,6 +19,14 @@ support, which isn't guaranteed present in every Lambda layer build
 'S3FileSystem'" on AWSSDKPandas-Python314). Downloading bytes via boto3
 and parsing with plain pyarrow.parquet avoids this dependency entirely.
 
+IMPORTANT: event_date and survey_name are written into the S3 KEY PATH
+as Hive-style partitions (event_date=.../survey_name=.../), and are
+deliberately EXCLUDED from the JSON body itself. Including them in both
+places causes the Glue Crawler to register two columns with the same
+name (one from the partition, one from the file content), which
+Trino/Starburst rejects with "Table descriptor contains duplicate
+columns."
+
 Requires a Lambda layer with `pyarrow` installed (e.g. AWSSDKPandas) --
 not in the default Lambda runtime.
 
@@ -500,6 +508,15 @@ def write_summary_to_s3(summary):
     Writes the daily summary as JSON to S3, Hive-partitioned by event_date
     and survey_name so a Glue crawler picks these up as partition columns.
 
+    IMPORTANT: event_date and survey_name are deliberately EXCLUDED from
+    the JSON body itself. They're already encoded in the S3 path via
+    Hive-style partitioning (event_date=.../survey_name=.../), and the
+    crawler infers them as partition columns from the path automatically.
+    Including them again inside the JSON body causes the crawler to
+    register two columns with the same name (one from the partition,
+    one from the file content), which Trino/Starburst rejects with
+    "Table descriptor contains duplicate columns."
+
     Active and raw-only surveys go to SEPARATE prefixes because their
     schemas differ (raw-only has "N/A" strings for sentiment/removed/
     unaccounted counts, active surveys have real integers). Mixing them
@@ -527,6 +544,11 @@ def write_summary_to_s3(summary):
     record = dict(summary)
     record["reason_breakdown"] = reason_breakdown_list
 
+    # Remove the partition-carried fields from the JSON body itself --
+    # see docstring above for why.
+    record.pop("event_date", None)
+    record.pop("survey_name", None)
+
     s3_client.put_object(
         Bucket=S3_REPORT_BUCKET,
         Key=key,
@@ -540,6 +562,11 @@ def write_anomaly_detail_to_s3(survey_name, event_date, unaccounted_ids, generat
     """
     Writes record-level detail ONLY when something is genuinely
     unaccounted for. Keeps the summary tables lean on normal days.
+
+    event_date and survey_name are excluded from the JSON body for the
+    same reason as write_summary_to_s3() -- they're already encoded in
+    the S3 partition path, and duplicating them in the body causes
+    crawler schema conflicts.
     """
     key = (
         f"{S3_REPORT_PREFIX}/anomaly_detail/"
@@ -548,8 +575,6 @@ def write_anomaly_detail_to_s3(survey_name, event_date, unaccounted_ids, generat
         f"detail.json"
     )
     detail = {
-        "event_date": event_date,
-        "survey_name": survey_name,
         "generated_at": generated_at,
         "unaccounted_contact_record_ids": unaccounted_ids,
     }
