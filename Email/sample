@@ -68,3 +68,14 @@ File 4: asd_wrapup_summary_load_final_tables.sql
 - PK for the anti-join purposes: conversation -> conversation_id; inquiry -> inquiry_id; inquiry_intent -> (inquiry_id, intent_id); inquiry_key_point -> (inquiry_id, key_point_seq); inquiry_topic -> (inquiry_id, topic_seq).
 
 Match the SQL style, comment headers, and step-marker/logging conventions used elsewhere in this repo (see shared_snowsql.py and existing *_load_final_tables.sql files as style reference).
+
+
+------
+{
+  "source": ["aws.states"],
+  "detail-type": ["Step Functions Execution Status Change"],
+  "detail": {
+    "status": ["SUCCEEDED"],
+    "stateMachineArn": ["arn:aws:states:us-east-1:0532-3486-1925:stateMachine:datalake-ccaas-sdap-survey-monitor-dev"]
+  }
+}
