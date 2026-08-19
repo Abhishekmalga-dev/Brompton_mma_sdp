@@ -563,9 +563,19 @@ def reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date
 def write_summary_to_s3(summary):
     """
     event_date and survey_name are deliberately EXCLUDED from the JSON
-    body -- they're already encoded in the S3 partition path, and
-    including them in both places causes the Glue Crawler to register
-    duplicate columns (Trino/Starburst rejects this outright).
+    body -- they're already encoded in the S3 partition path.
+
+    IMPORTANT: reason_breakdown must NEVER serialize as a truly empty
+    array []. When zero records were removed for a survey+date, an
+    empty array gives the Glue Crawler nothing to infer a struct shape
+    from, so it falls back to array<string> for that one partition --
+    while every other partition (with real removed records) correctly
+    infers array<struct<removal_reason:string,record_count:int>>. That
+    type mismatch across partitions is exactly what Trino/Starburst
+    rejects with "types are incompatible and cannot be coerced."
+    Using a consistent placeholder struct element on zero-removal days
+    keeps every partition's shape identical, so the crawler infers the
+    same type everywhere.
     """
     is_active = summary["pipeline_status"] == "ACTIVE"
     subfolder = "summary_active" if is_active else "summary_raw_only"
@@ -577,10 +587,18 @@ def write_summary_to_s3(summary):
         f"report.json"
     )
 
-    reason_breakdown_list = [
-        {"removal_reason": reason, "record_count": count}
-        for reason, count in summary.get("reason_breakdown", {}).items()
-    ]
+    reason_breakdown_source = summary.get("reason_breakdown", {})
+    if reason_breakdown_source:
+        reason_breakdown_list = [
+            {"removal_reason": reason, "record_count": count}
+            for reason, count in reason_breakdown_source.items()
+        ]
+    else:
+        # No records removed -- use a placeholder struct element so
+        # this partition's array shape matches every other partition's,
+        # instead of writing an empty array that the crawler can't
+        # infer a struct type from.
+        reason_breakdown_list = [{"removal_reason": "NONE", "record_count": 0}]
 
     record = dict(summary)
     record["reason_breakdown"] = reason_breakdown_list
