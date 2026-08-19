@@ -252,42 +252,40 @@ def count_all_raw_survey_records(event_date):
     """
     Reads ONLY the most recently modified Raw JSON file for event_date,
     via Spark, and counts records per survey type -- all in one pass.
-
-    Even the single latest file spans a rolling ~7-day window
-    internally, so each record is only counted toward event_date if its
-    own "Invitation Date" falls on that exact day. Records with a
-    missing/blank Invitation Date are excluded (not counted toward any
-    date), rather than guessed at.
-
-    Returns a dict: {raw_survey_name_lowercase: count}
+    Wrapped in an explicit try/except so that if this Spark read fails,
+    the log message names the exact S3 key involved -- no need to hunt
+    through Spark stage/task failure logs to find out which file broke.
     """
     latest_key = get_latest_raw_file_key(event_date)
     if latest_key is None:
         return {}
 
     raw_path = f"s3://{RAW_BUCKET}/{latest_key}"
-    # The Raw file's top level is a single flat JSON array, not
-    # newline-delimited JSON -- multiLine is required for Spark to
-    # parse it correctly.
-    raw_df = spark.read.option("multiLine", "true").json(raw_path)
 
-    filtered_df = (
-        raw_df
-        .withColumn("_invitation_date_str", F.substring(F.col(RAW_INVITATION_DATE_FIELD), 1, 10))
-        .filter(F.col(RAW_INVITATION_DATE_FIELD).isNotNull())
-        .filter(F.trim(F.col(RAW_INVITATION_DATE_FIELD)) != "")
-        .filter(F.col("_invitation_date_str") == event_date)
-        .withColumn("_survey_name_lower", F.lower(F.trim(F.col(RAW_SURVEY_TYPE_FIELD))))
-    )
+    try:
+        raw_df = spark.read.option("multiLine", "true").json(raw_path)
 
-    rows = (
-        filtered_df
-        .groupBy("_survey_name_lower")
-        .count()
-        .collect()
-    )
+        filtered_df = (
+            raw_df
+            .withColumn("_invitation_date_str", F.substring(F.col(RAW_INVITATION_DATE_FIELD), 1, 10))
+            .filter(F.col(RAW_INVITATION_DATE_FIELD).isNotNull())
+            .filter(F.trim(F.col(RAW_INVITATION_DATE_FIELD)) != "")
+            .filter(F.col("_invitation_date_str") == event_date)
+            .withColumn("_survey_name_lower", F.lower(F.trim(F.col(RAW_SURVEY_TYPE_FIELD))))
+        )
 
-    return {row["_survey_name_lower"]: row["count"] for row in rows}
+        rows = (
+            filtered_df
+            .groupBy("_survey_name_lower")
+            .count()
+            .collect()
+        )
+
+        return {row["_survey_name_lower"]: row["count"] for row in rows}
+
+    except Exception as e:
+        logger.error(f"RAW READ FAILED for event_date={event_date}, path={raw_path}: {e}")
+        raise
 
 
 def read_parquet_df(bucket, prefix):
