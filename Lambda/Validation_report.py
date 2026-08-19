@@ -19,11 +19,21 @@ support, which isn't guaranteed present in every Lambda layer build
 'S3FileSystem'" on AWSSDKPandas-Python314). Downloading bytes via boto3
 and parsing with plain pyarrow.parquet avoids this dependency entirely.
 
-IMPORTANT: event_date and survey_name are written into the S3 KEY PATH
-as Hive-style partitions (event_date=.../survey_name=.../), and are
-deliberately EXCLUDED from the JSON body itself. Including them in both
-places causes the Glue Crawler to register two columns with the same
-name (one from the partition, one from the file content), which
+IMPORTANT (Raw counting): the Raw file at event_date=X/ is NOT limited
+to records from day X alone -- it contains a rolling ~7-day window
+(today's file includes the past week's records too). Counting every
+record in the file would badly overcount versus Curated, which
+correctly isolates just that day's records during curation. To match
+Curated's counting, each Raw record is only counted toward event_date
+if its own "Invitation Date" field falls on that exact day -- this is
+the field that actually anchors a record to a specific day, independent
+of which weekly file it happened to arrive in.
+
+IMPORTANT (schema): event_date and survey_name are written into the S3
+KEY PATH as Hive-style partitions (event_date=.../survey_name=.../), and
+are deliberately EXCLUDED from the JSON body itself. Including them in
+both places causes the Glue Crawler to register two columns with the
+same name (one from the partition, one from the file content), which
 Trino/Starburst rejects with "Table descriptor contains duplicate
 columns."
 
@@ -66,6 +76,10 @@ QUARANTINE_PREFIX_BASE = "sentiment_analysis/removed_records"  # + /{quarantine_
 # Confirmed against an actual Raw JSON record.
 RAW_SURVEY_TYPE_FIELD = "Survey Name"
 RAW_CONTACT_ID_FIELD = "Contact Record ID"
+
+# Anchors a Raw record to a specific day, since the Raw file itself
+# spans a rolling ~7-day window rather than just one day's records.
+RAW_INVITATION_DATE_FIELD = "Invitation Date"
 
 # Curated/Sentiment/Quarantine Parquet layers use snake_case column names
 # (normalized by the curation job) -- different from the Raw JSON field
@@ -271,9 +285,20 @@ def count_all_raw_survey_records(event_date):
     Reads the Raw JSON file(s) for a given event_date ONCE, and counts
     records for ALL survey types in a single pass -- rather than
     re-reading and re-parsing the same files once per survey (7 reads of
-    identical data for one date). Raw has all surveys mixed together in
-    one flat JSON array per day, so this single pass is strictly more
-    efficient given there are always multiple surveys to count.
+    identical data for one date).
+
+    IMPORTANT: the Raw file at event_date=X/ is NOT limited to records
+    from day X alone -- it contains a rolling ~7-day window (today's
+    file includes the past week's records too). Counting every record
+    in the file would badly overcount versus Curated, which correctly
+    isolates just that day's records during curation.
+
+    To match Curated's counting, each record is only counted if its own
+    "Invitation Date" falls on the target event_date -- this is the
+    field that actually anchors a record to a specific day, independent
+    of which weekly file it happened to arrive in. Records with a
+    missing/blank Invitation Date are skipped entirely (not counted
+    toward any date), rather than guessed at.
 
     Returns a dict: {raw_survey_name_lowercase: count}
     """
@@ -293,6 +318,17 @@ def count_all_raw_survey_records(event_date):
             records = json.loads(content)  # top-level is a flat JSON array
 
             for record in records:
+                invitation_date_raw = record.get(RAW_INVITATION_DATE_FIELD, "")
+                if not invitation_date_raw:
+                    continue
+
+                # "Invitation Date" is "YYYY-MM-DD HH:MM:SS" -- take just
+                # the date portion (first 10 chars) to compare against
+                # the target event_date, which is a plain "YYYY-MM-DD".
+                record_date = invitation_date_raw.strip()[:10]
+                if record_date != event_date:
+                    continue
+
                 survey_value = record.get(RAW_SURVEY_TYPE_FIELD, "")
                 key_lower = survey_value.strip().lower()
                 counts[key_lower] = counts.get(key_lower, 0) + 1
