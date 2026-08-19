@@ -51,16 +51,24 @@ logger = logging.getLogger(__name__)
 # JOB SETUP
 # =============================================================================
 
-args = getResolvedOptions(
-    sys.argv,
-    ['JOB_NAME', 'ENV', 'EVENT_DATE', 'EVENT_DATES_S3_PATH']
-)
-# EVENT_DATE and EVENT_DATES_S3_PATH are optional -- getResolvedOptions
-# requires them to be listed to be parsed if present, but we treat
-# missing/empty values as "not provided" below.
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'ENV'])
 ENV = args.get('ENV', 'dev')
-EVENT_DATE_PARAM = args.get('EVENT_DATE', '').strip()
-EVENT_DATES_S3_PATH_PARAM = args.get('EVENT_DATES_S3_PATH', '').strip()
+
+def _get_optional_arg(name):
+    """
+    Manually checks sys.argv for an optional --NAME value, since
+    getResolvedOptions can't express "required if present, fine if
+    absent" -- it only knows "must be present."
+    """
+    flag = f"--{name}"
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1].strip()
+    return ""
+
+EVENT_DATE_PARAM = _get_optional_arg('EVENT_DATE')
+EVENT_DATES_S3_PATH_PARAM = _get_optional_arg('EVENT_DATES_S3_PATH')
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
