@@ -1,33 +1,42 @@
 """
-datalake-reconciliation-report-dev (PySpark version)
+datalake-ccaas-reconciliation-report-dev (PySpark version)
 
 Reconciles record counts across Raw -> Curated -> Sentiment for all
-survey types, explains removed records via quarantine Parquet files,
-and flags any records that vanished WITHOUT a quarantine entry
+survey types, explains removed records via quarantine CSV files, and
+flags any records that vanished WITHOUT a quarantine entry
 (unaccounted_count).
 
-Reads Parquet natively via Spark (spark.read.parquet), matching the
-pattern already used across this project's other Glue jobs -- no
-pyarrow dependency, no additional Python modules to install.
+Reads Curated/Sentiment Parquet natively via Spark (spark.read.parquet),
+matching the pattern already used across this project's other Glue
+jobs. Quarantine (removed_records) is CSV, not Parquet -- confirmed
+from an actual CANNOT_READ_FILE_FOOTER failure caused by a
+removed_records.csv file -- and is read via spark.read.csv() instead.
 
-Raw JSON is also read via Spark (spark.read.json with multiLine),
-except for finding the LATEST file per event_date partition, which
-still needs a boto3 listing since Spark has no concept of "most
-recently modified file" -- mirrors the get_latest_raw_file() pattern
-already used in the survey curation job.
+Raw JSON is read via Spark (spark.read.json with multiLine), except for
+finding the LATEST file per event_date partition, which needs a boto3
+listing since Spark has no concept of "most recently modified file" --
+mirrors the get_latest_raw_file() pattern already used in the survey
+curation job. Even the single latest Raw file spans a rolling ~7-day
+window internally, so records are only counted toward a given
+event_date if their own "Invitation Date" falls on that exact day.
 
 Boto3 is used only for things Spark doesn't do: checking whether a
 partition path has any data before attempting a Spark read (avoids
-AnalysisException on a missing path), writing the small JSON report +
-DynamoDB items, and triggering the Glue crawler.
+AnalysisException on a missing path), finding the latest Raw file,
+writing the small JSON report + DynamoDB items, and triggering the
+Glue crawler.
 
 Job modes (set via job parameters):
-    --EVENT_DATE            reconcile exactly one date
+    --EVENT_DATE             reconcile exactly one date
     --EVENT_DATES_S3_PATH    reconcile every date listed in
-                             event_dates.json (same control file the
-                             curation/sentiment jobs already use)
-    (neither set)            live mode -- each survey resolves its own
-                             latest available date independently
+                              event_dates.json (same control file the
+                              curation/sentiment jobs already use)
+    (neither set)             live mode -- each survey resolves its own
+                              latest available date independently
+
+Both EVENT_DATE and EVENT_DATES_S3_PATH are OPTIONAL. getResolvedOptions
+treats every name passed to it as REQUIRED, so these two are read
+manually from sys.argv instead -- see _get_optional_arg() below.
 
 Starburst never appears in this script. It only ever sees this
 pipeline's OUTPUT, via the Glue Crawler triggered at the end.
@@ -51,8 +60,10 @@ logger = logging.getLogger(__name__)
 # JOB SETUP
 # =============================================================================
 
+# Only JOB_NAME and ENV are actually required to start the job.
 args = getResolvedOptions(sys.argv, ['JOB_NAME', 'ENV'])
 ENV = args.get('ENV', 'dev')
+
 
 def _get_optional_arg(name):
     """
@@ -66,6 +77,7 @@ def _get_optional_arg(name):
         if idx + 1 < len(sys.argv):
             return sys.argv[idx + 1].strip()
     return ""
+
 
 EVENT_DATE_PARAM = _get_optional_arg('EVENT_DATE')
 EVENT_DATES_S3_PATH_PARAM = _get_optional_arg('EVENT_DATES_S3_PATH')
@@ -88,6 +100,10 @@ CURATED_PREFIX_BASE = "ccaas"
 
 SENTIMENT_PREFIX_BASE = "sentiment_analysis/final"
 QUARANTINE_PREFIX_BASE = "sentiment_analysis/removed_records"
+
+# Control file the Glue jobs already use to know which dates to process.
+EVENT_DATES_BUCKET = "psegli-datalakenonprodli-datalake-temp-dev"
+EVENT_DATES_KEY = "sentiment_analysis/event_date/event_dates.json"
 
 RAW_SURVEY_TYPE_FIELD = "Survey Name"
 RAW_CONTACT_ID_FIELD = "Contact Record ID"
@@ -167,7 +183,7 @@ glue_client = boto3.client("glue")
 
 
 # =============================================================================
-# EVENT DATE INPUT
+# EVENT DATE DISCOVERY
 # =============================================================================
 
 def get_dates_from_control_file(s3_path):
@@ -183,11 +199,11 @@ def get_dates_from_control_file(s3_path):
 def resolve_dates_to_process():
     """
     Decides which date(s) this run covers, based on job parameters:
-      1. EVENT_DATE set        -> exactly that one date
+      1. EVENT_DATE set          -> exactly that one date
       2. EVENT_DATES_S3_PATH set -> every date in the control file
-      3. neither set            -> [None], meaning "live mode": each
-                                    survey resolves its own latest date
-                                    independently inside reconcile_survey()
+      3. neither set              -> [None], meaning "live mode": each
+                                     survey resolves its own latest date
+                                     independently inside reconcile_survey()
     """
     if EVENT_DATE_PARAM:
         return [EVENT_DATE_PARAM]
@@ -197,7 +213,7 @@ def resolve_dates_to_process():
 
 
 # =============================================================================
-# S3 / PARQUET / JSON HELPERS
+# S3 / PARQUET / CSV / JSON HELPERS
 # =============================================================================
 
 def partition_has_data(bucket, prefix):
@@ -209,7 +225,7 @@ def partition_has_data(bucket, prefix):
 def get_latest_event_date(bucket, prefix):
     """
     Returns the most recent event_date=YYYY-MM-DD partition folder under
-    a prefix, or None. Used only in live mode (no EVENT_DATE / 
+    a prefix, or None. Used only in live mode (no EVENT_DATE /
     EVENT_DATES_S3_PATH param given).
     """
     if not prefix.endswith("/"):
@@ -252,9 +268,17 @@ def count_all_raw_survey_records(event_date):
     """
     Reads ONLY the most recently modified Raw JSON file for event_date,
     via Spark, and counts records per survey type -- all in one pass.
-    Wrapped in an explicit try/except so that if this Spark read fails,
-    the log message names the exact S3 key involved -- no need to hunt
-    through Spark stage/task failure logs to find out which file broke.
+
+    Even the single latest file spans a rolling ~7-day window
+    internally, so each record is only counted toward event_date if its
+    own "Invitation Date" falls on that exact day. Records with a
+    missing/blank Invitation Date are excluded entirely, rather than
+    guessed at.
+
+    Wrapped in try/except so that if this Spark read fails, the log
+    message names the exact S3 key involved.
+
+    Returns a dict: {raw_survey_name_lowercase: count}
     """
     latest_key = get_latest_raw_file_key(event_date)
     if latest_key is None:
@@ -289,10 +313,45 @@ def count_all_raw_survey_records(event_date):
 
 
 def read_parquet_df(bucket, prefix):
-    """Reads a Parquet partition via Spark, or None if the path has no data."""
+    """
+    Reads a Curated/Sentiment Parquet partition via Spark, restricted to
+    *.parquet files only. Some partitions have picked up stray
+    non-Parquet files -- reading the whole prefix without this filter
+    makes Spark try to parse those as Parquet and fail with
+    CANNOT_READ_FILE_FOOTER. Restricting the glob to *.parquet avoids
+    this regardless of what other files happen to be sitting in the
+    same folder.
+    Returns None if the partition has no matching Parquet files.
+    """
     if not partition_has_data(bucket, prefix):
         return None
-    return spark.read.parquet(f"s3://{bucket}/{prefix}")
+
+    full_prefix = f"s3://{bucket}/{prefix}"
+    glob_path = full_prefix.rstrip("/") + "/*.parquet"
+
+    try:
+        return spark.read.parquet(glob_path)
+    except Exception as e:
+        logger.warning(f"No readable Parquet files found at {glob_path}: {e}")
+        return None
+
+
+def read_csv_df(bucket, prefix):
+    """
+    Reads quarantine (removed_records) data via Spark's CSV reader.
+    CONFIRMED: unlike Curated/Sentiment, which are Parquet, the
+    quarantine layer is written as CSV (removed_records.csv files, with
+    a header row containing contact_record_id, removal_reason,
+    survey_type, event_date, etc.) -- discovered via a
+    CANNOT_READ_FILE_FOOTER failure when this was previously read as
+    Parquet.
+    Returns None if the partition has no data.
+    """
+    if not partition_has_data(bucket, prefix):
+        return None
+
+    full_prefix = f"s3://{bucket}/{prefix}"
+    return spark.read.option("header", "true").csv(full_prefix)
 
 
 def count_df_rows(df):
@@ -384,7 +443,7 @@ def reconcile_active_survey(survey_config, event_date, raw_count):
 
     curated_df = read_parquet_df(CURATED_BUCKET, curated_prefix)
     sentiment_df = read_parquet_df(CURATED_BUCKET, sentiment_prefix)
-    quarantine_df = read_parquet_df(CURATED_BUCKET, quarantine_prefix)
+    quarantine_df = read_csv_df(CURATED_BUCKET, quarantine_prefix)
 
     curated_count = count_df_rows(curated_df)
     sentiment_count = count_df_rows(sentiment_df)
@@ -404,8 +463,6 @@ def reconcile_active_survey(survey_config, event_date, raw_count):
         )
         missing_ids = [row[CONTACT_RECORD_ID_COLUMN] for row in missing_ids_df.collect()]
     elif curated_df is not None:
-        # Sentiment has no data at all for this date -- everything in
-        # Curated is "missing" from Sentiment.
         missing_ids = [
             row[CONTACT_RECORD_ID_COLUMN]
             for row in curated_df.select(CONTACT_RECORD_ID_COLUMN).distinct().collect()
@@ -413,7 +470,7 @@ def reconcile_active_survey(survey_config, event_date, raw_count):
     else:
         missing_ids = []
 
-    # --- Explain missing IDs via quarantine ---
+    # --- Explain missing IDs via quarantine (CSV) ---
     if quarantine_df is not None and missing_ids:
         quarantine_rows = (
             quarantine_df
@@ -474,7 +531,6 @@ def reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date
     if event_date_override:
         event_date = event_date_override
     else:
-        # Live mode: resolve each survey's own latest available date.
         if sentiment_active:
             date_source_prefix = f"{SENTIMENT_PREFIX_BASE}/{survey_config['sentiment_folder']}"
         else:
