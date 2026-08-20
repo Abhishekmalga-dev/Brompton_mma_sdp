@@ -7,27 +7,33 @@ flags any records that vanished WITHOUT a quarantine entry
 (unaccounted_count).
 
 Reads Curated/Sentiment Parquet natively via Spark (spark.read.parquet).
-Quarantine (removed_records) is CSV, not Parquet -- confirmed from an
-actual CANNOT_READ_FILE_FOOTER failure -- and is read via
+Quarantine (removed_records) is CSV, not Parquet, and is read via
 spark.read.csv().
 
-Raw JSON is read via Spark, except for finding the LATEST file per
-event_date partition (boto3 listing, since Spark has no concept of
-"most recently modified file"). Even the single latest Raw file spans
-a rolling ~7-day window internally, so records are only counted toward
-a given event_date if their own "Invitation Date" falls on that exact
-day.
+RAW COUNTING (IMPORTANT): Raw is repeatedly re-ingested, and a given
+event_date=X/ folder can accumulate MULTIPLE files over time (each
+delivery carries a rolling ~7-day window). A record for event_date X
+can end up sitting in an OLDER file if a later re-ingestion's window
+didn't happen to include it again -- picking only the single
+most-recently-modified file can silently MISS records that are only
+present in an earlier file (confirmed case: IVR records for a specific
+date were present in an older file but absent from the latest
+re-ingested one).
 
-Output: ONE unified table (not split active/raw_only). Raw-only
-surveys write Python None (-> JSON null) for sentiment_count/
-removed_count/unaccounted_count, keeping those columns a proper
-nullable int in the crawled schema rather than mixing in the string
-"N/A" (which would force the crawler to infer STRING everywhere).
-reason_breakdown is written as a single human-readable STRING (e.g.
-"DEDUP_CASE_2: 4, DEDUP_CASE_1: 1", or "NONE"), not an array of
-structs -- avoids the array/struct schema-inference conflict hit
-earlier (empty array vs. populated array producing incompatible
-crawler types), and is directly readable without unnesting.
+To handle this correctly: read EVERY .json file in the event_date
+folder, filter each by Invitation Date == event_date, combine all
+filtered results together, then DEDUPLICATE by Contact Record ID across
+the combined set. This is safe against BOTH failure modes -- missing
+records that only live in an older file, and double-counting records
+that appear in more than one overlapping re-ingested file.
+
+Output: ONE unified table (data_reconciliation_report), not split
+active/raw_only. Raw-only surveys write Python None (-> JSON null) for
+sentiment_count/removed_count/unaccounted_count, keeping those columns
+a proper nullable int in the crawled schema. reason_breakdown is a
+single human-readable STRING (e.g. "DEDUP_CASE_2: 4", or "NONE"), not
+an array of structs -- avoids array/struct schema-inference conflicts
+and is directly readable without unnesting.
 
 Job modes (set via job parameters):
     --EVENT_DATE             reconcile exactly one date
@@ -173,9 +179,6 @@ SURVEY_CONFIGS = [
 ]
 
 # Report storage -- single unified table, named data_reconciliation_report.
-# The crawler names the table after the last folder before the
-# event_date= partitions, so that folder is literally
-# "data_reconciliation_report".
 S3_REPORT_BUCKET = "psegli-datalakenonprodli-datalake-curated-dev"
 S3_REPORT_PREFIX = "ccaas"
 REPORT_TABLE_FOLDER = "data_reconciliation_report"
@@ -242,83 +245,72 @@ def get_latest_event_date(bucket, prefix):
     return sorted(dates)[-1] if dates else None
 
 
-def get_latest_raw_file_key(event_date):
+def count_all_raw_survey_records(event_date):
     """
-    An event_date=X/ partition in Raw can contain MULTIPLE files, since
-    each day's delivery carries a rolling 7-day window. Only the MOST
-    RECENTLY MODIFIED file is trusted. Mirrors get_latest_raw_file()
-    from the survey curation job.
+    Reads EVERY Raw JSON file in this event_date's folder (not just the
+    most recently modified one), filters each by Invitation Date ==
+    event_date, combines all filtered results, then DEDUPLICATES by
+    Contact Record ID across all files combined.
+
+    Safe against both failure modes: a record only present in an older
+    file (missed by "latest file only"), and a record present in
+    multiple overlapping re-ingested files (would be double-counted by
+    a naive sum across files).
+
+    Returns a dict: {raw_survey_name_lowercase: distinct_count}
     """
     prefix = f"{RAW_PREFIX}/event_date={event_date}/"
     paginator = s3_client.get_paginator("list_objects_v2")
 
-    latest_key = None
-    latest_modified = None
+    json_keys = []
     for page in paginator.paginate(Bucket=RAW_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
-            if not obj["Key"].endswith(".json"):
-                continue
-            if latest_modified is None or obj["LastModified"] > latest_modified:
-                latest_modified = obj["LastModified"]
-                latest_key = obj["Key"]
-    return latest_key
+            if obj["Key"].endswith(".json"):
+                json_keys.append(obj["Key"])
 
-
-def count_all_raw_survey_records(event_date):
-    """
-    Reads ONLY the most recently modified Raw JSON file for event_date,
-    via Spark, and counts records per survey type -- all in one pass.
-    Each record is only counted toward event_date if its own
-    "Invitation Date" falls on that exact day.
-
-    DIAGNOSTIC LOGGING: added to trace a raw_count=0 issue seen against
-    real IVR data where Curated/Sentiment counts were populated but Raw
-    counts came back zero. Logs total record count, post-filter count,
-    and the actual survey_name keys found -- lets us confirm whether
-    this is a date-filter mismatch, a survey-name mismatch, or
-    something else, without guessing.
-
-    Returns a dict: {raw_survey_name_lowercase: count}
-    """
-    latest_key = get_latest_raw_file_key(event_date)
-    if latest_key is None:
-        logger.warning(f"No Raw file found at all for event_date={event_date}")
+    if not json_keys:
+        logger.warning(f"No Raw files found at all for event_date={event_date}")
         return {}
 
-    raw_path = f"s3://{RAW_BUCKET}/{latest_key}"
+    logger.info(f"event_date={event_date}: found {len(json_keys)} Raw file(s) to combine: {json_keys}")
 
-    try:
-        raw_df = spark.read.option("multiLine", "true").json(raw_path)
-        total_records = raw_df.count()
-        logger.info(f"event_date={event_date}: Raw file {raw_path} has {total_records} total records")
+    combined_df = None
 
-        filtered_df = (
-            raw_df
-            .withColumn("_invitation_date_str", F.substring(F.col(RAW_INVITATION_DATE_FIELD), 1, 10))
-            .filter(F.col(RAW_INVITATION_DATE_FIELD).isNotNull())
-            .filter(F.trim(F.col(RAW_INVITATION_DATE_FIELD)) != "")
-            .filter(F.col("_invitation_date_str") == event_date)
-            .withColumn("_survey_name_lower", F.lower(F.trim(F.col(RAW_SURVEY_TYPE_FIELD))))
-        )
+    for key in json_keys:
+        raw_path = f"s3://{RAW_BUCKET}/{key}"
+        try:
+            raw_df = spark.read.option("multiLine", "true").json(raw_path)
 
-        filtered_count = filtered_df.count()
-        logger.info(f"event_date={event_date}: {filtered_count} records matched Invitation Date == {event_date}")
+            filtered_df = (
+                raw_df
+                .withColumn("_invitation_date_str", F.substring(F.col(RAW_INVITATION_DATE_FIELD), 1, 10))
+                .filter(F.col(RAW_INVITATION_DATE_FIELD).isNotNull())
+                .filter(F.trim(F.col(RAW_INVITATION_DATE_FIELD)) != "")
+                .filter(F.col("_invitation_date_str") == event_date)
+                .withColumn("_survey_name_lower", F.lower(F.trim(F.col(RAW_SURVEY_TYPE_FIELD))))
+                .select(
+                    F.col(RAW_CONTACT_ID_FIELD).alias("_contact_id"),
+                    "_survey_name_lower"
+                )
+            )
 
-        rows = (
-            filtered_df
-            .groupBy("_survey_name_lower")
-            .count()
-            .collect()
-        )
+            combined_df = filtered_df if combined_df is None else combined_df.unionByName(filtered_df)
 
-        result = {row["_survey_name_lower"]: row["count"] for row in rows}
-        logger.info(f"event_date={event_date}: survey_name keys found in Raw = {list(result.keys())}")
+        except Exception as e:
+            logger.error(f"RAW READ FAILED for event_date={event_date}, path={raw_path}: {e}")
+            raise
 
-        return result
+    if combined_df is None:
+        return {}
 
-    except Exception as e:
-        logger.error(f"RAW READ FAILED for event_date={event_date}, path={raw_path}: {e}")
-        raise
+    distinct_df = combined_df.dropDuplicates(["_contact_id"])
+
+    rows = distinct_df.groupBy("_survey_name_lower").count().collect()
+    result = {row["_survey_name_lower"]: row["count"] for row in rows}
+
+    logger.info(f"event_date={event_date}: distinct survey_name keys/counts = {result}")
+
+    return result
 
 
 def read_parquet_df(bucket, prefix):
@@ -566,13 +558,12 @@ def reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date
 
 def write_summary_to_s3(summary):
     """
-    Writes to a SINGLE unified table folder (data_reconciliation_report),
-    not split active/raw_only. event_date and survey_name are excluded
-    from the JSON body -- already encoded in the S3 partition path.
+    Writes to a SINGLE unified table folder (data_reconciliation_report).
+    event_date and survey_name are excluded from the JSON body -- already
+    encoded in the S3 partition path.
 
     reason_breakdown is a plain STRING (e.g. "DEDUP_CASE_2: 4", or
-    "NONE"), not an array of structs -- avoids array/struct schema
-    conflicts and is directly readable without unnesting.
+    "NONE"), not an array of structs.
     """
     key = (
         f"{S3_REPORT_PREFIX}/{REPORT_TABLE_FOLDER}/"
