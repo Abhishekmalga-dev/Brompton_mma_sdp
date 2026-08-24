@@ -16,22 +16,20 @@ RAW COUNTING: Raw is repeatedly re-ingested, and a given event_date=X/
 folder can accumulate MULTIPLE files over time. Reads EVERY .json file
 in the folder, filters each by Invitation Date == event_date, combines
 all filtered results, then DEDUPLICATES by Contact Record ID across the
-combined set -- safe against both missing records that only live in an
-older file, and double-counting records present in multiple overlapping
-re-ingested files.
+combined set.
 
-DASHBOARD COUNTING: unlike Raw, the dashboard CSV is a single file per
-survey, always overwritten in place -- no multi-file merge needed.
-raw_invitation_date is formatted "M/D/YYYY H:MM" (variable-width, no
-leading zeros) -- DIFFERENT from Raw's fixed-width "YYYY-MM-DD
-HH:MM:SS" -- so it's parsed with Spark's to_date() and an explicit
-format string, not a substring.
+DASHBOARD COUNTING: single file per survey, always overwritten in
+place. raw_invitation_date's time portion format is unreliable to match
+exactly (Excel's rendered display doesn't reflect the literal
+underlying string, and an exact "M/d/yyyy H:mm" pattern silently
+produced 0 matches). Fixed by splitting on the first space and parsing
+ONLY the date portion ("M/d/yyyy"), ignoring whatever the time portion
+actually looks like.
 
 Output: ONE unified table (data_reconciliation_report). Raw-only
 surveys write Python None (-> JSON null) for sentiment_count/
 dashboard_count/removed_count/unaccounted_count. reason_breakdown is a
-single human-readable STRING (e.g. "DEDUP_CASE_2: 4", or "NONE"), not
-an array of structs.
+single human-readable STRING (e.g. "DEDUP_CASE_2: 4", or "NONE").
 
 Job modes (set via job parameters):
     --EVENT_DATE             reconcile exactly one date
@@ -327,9 +325,13 @@ def count_dashboard_records(survey_name, event_date):
     filters by raw_invitation_date == event_date, and counts DISTINCT
     raw_contact_record_id.
 
-    raw_invitation_date is "M/D/YYYY H:MM" (variable-width, no leading
-    zeros) -- parsed via Spark's to_date() with an explicit format
-    string rather than a substring, since string length varies.
+    raw_invitation_date's time portion format is unreliable to match
+    exactly -- an Excel screenshot's rendered display does not reflect
+    the literal underlying string, and an exact "M/d/yyyy H:mm" pattern
+    silently produced 0 matches (Spark's to_date() returns NULL on a
+    non-matching pattern rather than erroring). Fixed by splitting on
+    the first space and parsing ONLY the date portion ("M/d/yyyy"),
+    ignoring whatever the time portion actually looks like.
 
     This file has no historical versions -- it's always overwritten in
     place. Reconciliation only ever sees "the current state of this
@@ -353,16 +355,19 @@ def count_dashboard_records(survey_name, event_date):
 
     try:
         dashboard_df = spark.read.option("header", "true").csv(dashboard_path)
+        total_records = dashboard_df.count()
+        logger.info(f"{survey_name} {event_date}: dashboard file {dashboard_path} has {total_records} total records")
 
         filtered_df = (
             dashboard_df
-            .withColumn(
-                "_invitation_date_parsed",
-                F.to_date(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), "M/d/yyyy H:mm")
-            )
+            .withColumn("_date_part", F.split(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), " ").getItem(0))
+            .withColumn("_invitation_date_parsed", F.to_date(F.col("_date_part"), "M/d/yyyy"))
             .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
             .filter(F.col("_invitation_date_parsed") == F.to_date(F.lit(event_date), "yyyy-MM-dd"))
         )
+
+        filtered_count = filtered_df.count()
+        logger.info(f"{survey_name} {event_date}: {filtered_count} dashboard records matched after date parsing")
 
         distinct_count = (
             filtered_df
