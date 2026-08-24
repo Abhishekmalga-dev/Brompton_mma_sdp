@@ -19,12 +19,13 @@ all filtered results, then DEDUPLICATES by Contact Record ID across the
 combined set.
 
 DASHBOARD COUNTING: single file per survey, always overwritten in
-place. raw_invitation_date's exact format is still UNCONFIRMED -- two
-prior attempts (exact "M/d/yyyy H:mm" match, then split-on-space +
-"M/d/yyyy" date-only match) both silently produced 0 matches across
-every survey. A raw-sample-value diagnostic is logged before any
-parsing is applied, so the actual literal string content can be
-inspected directly rather than guessed a third time.
+place. CONFIRMED via raw-sample-value diagnostic: raw_invitation_date
+contains a MIX of two different formats within the SAME column --
+"M/d/yyyy H:mm" (e.g. "3/27/2026 6:39") and "yyyy-MM-dd HH:mm:ss" (e.g.
+"2026-03-23 16:05:40"). Every earlier single-pattern parse attempt
+silently matched 0 rows because no single format covers the whole
+column. Fixed with coalesce() across both date patterns, so whichever
+format a given row actually uses gets picked up.
 
 Output: ONE unified table (data_reconciliation_report). Raw-only
 surveys write Python None (-> JSON null) for sentiment_count/
@@ -325,14 +326,10 @@ def count_dashboard_records(survey_name, event_date):
     filters by raw_invitation_date == event_date, and counts DISTINCT
     raw_contact_record_id.
 
-    DIAGNOSTIC: logs 5 raw, unprocessed sample values of
-    raw_invitation_date before any parsing is applied. Two prior format
-    assumptions ("M/d/yyyy H:mm" exact match, then split-on-space +
-    "M/d/yyyy") both silently produced 0 matches -- Spark's to_date()
-    returns NULL on a non-matching pattern rather than erroring, so a
-    wrong format assumption fails silently. This sample-value log lets
-    the actual literal string content be inspected directly instead of
-    guessed again.
+    CONFIRMED: raw_invitation_date contains a MIX of two different
+    formats within the SAME column -- "M/d/yyyy H:mm" and
+    "yyyy-MM-dd HH:mm:ss". coalesce() tries both date patterns and
+    takes whichever one actually parses for each row.
 
     This file has no historical versions -- it's always overwritten in
     place. Reconciliation only ever sees "the current state of this
@@ -359,24 +356,17 @@ def count_dashboard_records(survey_name, event_date):
         total_records = dashboard_df.count()
         logger.info(f"{survey_name} {event_date}: dashboard file {dashboard_path} has {total_records} total records")
 
-        # DIAGNOSTIC: raw, unprocessed sample values -- see docstring above.
-        sample_values = (
-            dashboard_df
-            .select(RAW_DASHBOARD_INVITATION_DATE_FIELD)
-            .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
-            .limit(5)
-            .collect()
-        )
-        logger.info(
-            f"{survey_name} {event_date}: raw sample values of "
-            f"{RAW_DASHBOARD_INVITATION_DATE_FIELD} = "
-            f"{[row[RAW_DASHBOARD_INVITATION_DATE_FIELD] for row in sample_values]}"
-        )
+        date_only = F.split(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), " ").getItem(0)
 
         filtered_df = (
             dashboard_df
-            .withColumn("_date_part", F.split(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), " ").getItem(0))
-            .withColumn("_invitation_date_parsed", F.to_date(F.col("_date_part"), "M/d/yyyy"))
+            .withColumn(
+                "_invitation_date_parsed",
+                F.coalesce(
+                    F.to_date(date_only, "M/d/yyyy"),
+                    F.to_date(date_only, "yyyy-MM-dd"),
+                )
+            )
             .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
             .filter(F.col("_invitation_date_parsed") == F.to_date(F.lit(event_date), "yyyy-MM-dd"))
         )
