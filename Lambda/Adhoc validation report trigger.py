@@ -19,12 +19,12 @@ all filtered results, then DEDUPLICATES by Contact Record ID across the
 combined set.
 
 DASHBOARD COUNTING: single file per survey, always overwritten in
-place. raw_invitation_date's time portion format is unreliable to match
-exactly (Excel's rendered display doesn't reflect the literal
-underlying string, and an exact "M/d/yyyy H:mm" pattern silently
-produced 0 matches). Fixed by splitting on the first space and parsing
-ONLY the date portion ("M/d/yyyy"), ignoring whatever the time portion
-actually looks like.
+place. raw_invitation_date's exact format is still UNCONFIRMED -- two
+prior attempts (exact "M/d/yyyy H:mm" match, then split-on-space +
+"M/d/yyyy" date-only match) both silently produced 0 matches across
+every survey. A raw-sample-value diagnostic is logged before any
+parsing is applied, so the actual literal string content can be
+inspected directly rather than guessed a third time.
 
 Output: ONE unified table (data_reconciliation_report). Raw-only
 surveys write Python None (-> JSON null) for sentiment_count/
@@ -325,13 +325,14 @@ def count_dashboard_records(survey_name, event_date):
     filters by raw_invitation_date == event_date, and counts DISTINCT
     raw_contact_record_id.
 
-    raw_invitation_date's time portion format is unreliable to match
-    exactly -- an Excel screenshot's rendered display does not reflect
-    the literal underlying string, and an exact "M/d/yyyy H:mm" pattern
-    silently produced 0 matches (Spark's to_date() returns NULL on a
-    non-matching pattern rather than erroring). Fixed by splitting on
-    the first space and parsing ONLY the date portion ("M/d/yyyy"),
-    ignoring whatever the time portion actually looks like.
+    DIAGNOSTIC: logs 5 raw, unprocessed sample values of
+    raw_invitation_date before any parsing is applied. Two prior format
+    assumptions ("M/d/yyyy H:mm" exact match, then split-on-space +
+    "M/d/yyyy") both silently produced 0 matches -- Spark's to_date()
+    returns NULL on a non-matching pattern rather than erroring, so a
+    wrong format assumption fails silently. This sample-value log lets
+    the actual literal string content be inspected directly instead of
+    guessed again.
 
     This file has no historical versions -- it's always overwritten in
     place. Reconciliation only ever sees "the current state of this
@@ -357,6 +358,20 @@ def count_dashboard_records(survey_name, event_date):
         dashboard_df = spark.read.option("header", "true").csv(dashboard_path)
         total_records = dashboard_df.count()
         logger.info(f"{survey_name} {event_date}: dashboard file {dashboard_path} has {total_records} total records")
+
+        # DIAGNOSTIC: raw, unprocessed sample values -- see docstring above.
+        sample_values = (
+            dashboard_df
+            .select(RAW_DASHBOARD_INVITATION_DATE_FIELD)
+            .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
+            .limit(5)
+            .collect()
+        )
+        logger.info(
+            f"{survey_name} {event_date}: raw sample values of "
+            f"{RAW_DASHBOARD_INVITATION_DATE_FIELD} = "
+            f"{[row[RAW_DASHBOARD_INVITATION_DATE_FIELD] for row in sample_values]}"
+        )
 
         filtered_df = (
             dashboard_df
