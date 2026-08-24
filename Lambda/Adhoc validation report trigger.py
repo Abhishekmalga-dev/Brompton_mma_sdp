@@ -1,51 +1,44 @@
 """
 datalake-ccaas-reconciliation-report-dev (PySpark version)
 
-Reconciles record counts across Raw -> Curated -> Sentiment for all
-survey types, explains removed records via quarantine CSV files, and
-flags any records that vanished WITHOUT a quarantine entry
+Reconciles record counts across Raw -> Curated -> Sentiment -> Dashboard
+for all survey types, explains removed records via quarantine CSV
+files, and flags any records that vanished WITHOUT a quarantine entry
 (unaccounted_count).
 
 Reads Curated/Sentiment Parquet natively via Spark (spark.read.parquet).
-Quarantine (removed_records) is CSV, not Parquet, and is read via
-spark.read.csv().
+Quarantine (removed_records) is CSV, read via spark.read.csv().
+Dashboard output is a single, always-overwritten CSV per survey (no
+event_date partitioning, no historical versions) -- filtered by its own
+raw_invitation_date column and deduplicated by raw_contact_record_id.
 
-RAW COUNTING (IMPORTANT): Raw is repeatedly re-ingested, and a given
-event_date=X/ folder can accumulate MULTIPLE files over time (each
-delivery carries a rolling ~7-day window). A record for event_date X
-can end up sitting in an OLDER file if a later re-ingestion's window
-didn't happen to include it again -- picking only the single
-most-recently-modified file can silently MISS records that are only
-present in an earlier file (confirmed case: IVR records for a specific
-date were present in an older file but absent from the latest
-re-ingested one).
+RAW COUNTING: Raw is repeatedly re-ingested, and a given event_date=X/
+folder can accumulate MULTIPLE files over time. Reads EVERY .json file
+in the folder, filters each by Invitation Date == event_date, combines
+all filtered results, then DEDUPLICATES by Contact Record ID across the
+combined set -- safe against both missing records that only live in an
+older file, and double-counting records present in multiple overlapping
+re-ingested files.
 
-To handle this correctly: read EVERY .json file in the event_date
-folder, filter each by Invitation Date == event_date, combine all
-filtered results together, then DEDUPLICATE by Contact Record ID across
-the combined set. This is safe against BOTH failure modes -- missing
-records that only live in an older file, and double-counting records
-that appear in more than one overlapping re-ingested file.
+DASHBOARD COUNTING: unlike Raw, the dashboard CSV is a single file per
+survey, always overwritten in place -- no multi-file merge needed.
+raw_invitation_date is formatted "M/D/YYYY H:MM" (variable-width, no
+leading zeros) -- DIFFERENT from Raw's fixed-width "YYYY-MM-DD
+HH:MM:SS" -- so it's parsed with Spark's to_date() and an explicit
+format string, not a substring.
 
-Output: ONE unified table (data_reconciliation_report), not split
-active/raw_only. Raw-only surveys write Python None (-> JSON null) for
-sentiment_count/removed_count/unaccounted_count, keeping those columns
-a proper nullable int in the crawled schema. reason_breakdown is a
+Output: ONE unified table (data_reconciliation_report). Raw-only
+surveys write Python None (-> JSON null) for sentiment_count/
+dashboard_count/removed_count/unaccounted_count. reason_breakdown is a
 single human-readable STRING (e.g. "DEDUP_CASE_2: 4", or "NONE"), not
-an array of structs -- avoids array/struct schema-inference conflicts
-and is directly readable without unnesting.
+an array of structs.
 
 Job modes (set via job parameters):
     --EVENT_DATE             reconcile exactly one date
     --EVENT_DATES_S3_PATH    reconcile every date listed in
-                              event_dates.json (same control file the
-                              curation/sentiment jobs already use)
+                              event_dates.json
     (neither set)             live mode -- each survey resolves its own
                               latest available date independently
-
-Both EVENT_DATE and EVENT_DATES_S3_PATH are OPTIONAL and read manually
-from sys.argv (see _get_optional_arg), since getResolvedOptions treats
-every name passed to it as REQUIRED.
 
 Starburst never appears in this script. It only ever sees this
 pipeline's OUTPUT, via the Glue Crawler triggered at the end.
@@ -119,6 +112,23 @@ RAW_INVITATION_DATE_FIELD = "Invitation Date"
 CONTACT_RECORD_ID_COLUMN = "contact_record_id"
 REMOVAL_REASON_COLUMN = "removal_reason"
 
+# Dashboard output -- single always-overwritten CSV per survey, no
+# event_date partitioning at the S3 path level.
+DASHBOARD_BUCKET = "psegli-datalakenonprodli-datalake-temp-dev"
+DASHBOARD_PREFIX = "Sentiment_Analysis/dashboard_output"
+
+RAW_DASHBOARD_CONTACT_ID_FIELD = "raw_contact_record_id"
+RAW_DASHBOARD_INVITATION_DATE_FIELD = "raw_invitation_date"
+
+# Exact filenames per survey, confirmed from the dashboard_output folder.
+DASHBOARD_FILE_MAP = {
+    "IVR": "ivr_final_output_all_columns_dashboard.csv",
+    "API_REL": "api_web_relational_final_output_all_columns_dashboard.csv",
+    "API_TXN": "api_web_transactional_final_output_all_columns_dashboard.csv",
+    "SMS_REL": "sms_web_relational_final_output_all_columns_dashboard.csv",
+    "SMS_TXN": "sms_web_transactional_final_output_all_columns_dashboard.csv",
+}
+
 SURVEY_CONFIGS = [
     {
         "survey_name": "IVR",
@@ -178,7 +188,6 @@ SURVEY_CONFIGS = [
     },
 ]
 
-# Report storage -- single unified table, named data_reconciliation_report.
 S3_REPORT_BUCKET = "psegli-datalakenonprodli-datalake-curated-dev"
 S3_REPORT_PREFIX = "ccaas"
 REPORT_TABLE_FOLDER = "data_reconciliation_report"
@@ -222,9 +231,13 @@ def resolve_dates_to_process():
 # S3 / PARQUET / CSV / JSON HELPERS
 # =============================================================================
 
-def partition_has_data(bucket, prefix):
-    """Checks whether an S3 prefix has any objects, before a Spark read."""
-    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+def partition_has_data(bucket, prefix_or_key):
+    """
+    Checks whether an S3 prefix (or exact key) has any objects, before
+    a Spark read. Works identically for a partition prefix or a single
+    flat file key.
+    """
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix_or_key, MaxKeys=1)
     return response.get("KeyCount", 0) > 0
 
 
@@ -251,11 +264,6 @@ def count_all_raw_survey_records(event_date):
     most recently modified one), filters each by Invitation Date ==
     event_date, combines all filtered results, then DEDUPLICATES by
     Contact Record ID across all files combined.
-
-    Safe against both failure modes: a record only present in an older
-    file (missed by "latest file only"), and a record present in
-    multiple overlapping re-ingested files (would be double-counted by
-    a naive sum across files).
 
     Returns a dict: {raw_survey_name_lowercase: distinct_count}
     """
@@ -313,6 +321,64 @@ def count_all_raw_survey_records(event_date):
     return result
 
 
+def count_dashboard_records(survey_name, event_date):
+    """
+    Reads the single, always-overwritten dashboard CSV for this survey,
+    filters by raw_invitation_date == event_date, and counts DISTINCT
+    raw_contact_record_id.
+
+    raw_invitation_date is "M/D/YYYY H:MM" (variable-width, no leading
+    zeros) -- parsed via Spark's to_date() with an explicit format
+    string rather than a substring, since string length varies.
+
+    This file has no historical versions -- it's always overwritten in
+    place. Reconciliation only ever sees "the current state of this
+    file," which is the correct behavior given how it's maintained
+    upstream.
+
+    Returns the distinct count as an int, or None if the file doesn't
+    exist yet for this survey.
+    """
+    filename = DASHBOARD_FILE_MAP.get(survey_name)
+    if filename is None:
+        return None
+
+    key = f"{DASHBOARD_PREFIX}/{filename}"
+
+    if not partition_has_data(DASHBOARD_BUCKET, key):
+        logger.warning(f"{survey_name}: dashboard file not found at s3://{DASHBOARD_BUCKET}/{key}")
+        return None
+
+    dashboard_path = f"s3://{DASHBOARD_BUCKET}/{key}"
+
+    try:
+        dashboard_df = spark.read.option("header", "true").csv(dashboard_path)
+
+        filtered_df = (
+            dashboard_df
+            .withColumn(
+                "_invitation_date_parsed",
+                F.to_date(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), "M/d/yyyy H:mm")
+            )
+            .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
+            .filter(F.col("_invitation_date_parsed") == F.to_date(F.lit(event_date), "yyyy-MM-dd"))
+        )
+
+        distinct_count = (
+            filtered_df
+            .select(RAW_DASHBOARD_CONTACT_ID_FIELD)
+            .distinct()
+            .count()
+        )
+
+        logger.info(f"{survey_name} {event_date}: dashboard_count={distinct_count} (from {dashboard_path})")
+        return distinct_count
+
+    except Exception as e:
+        logger.error(f"DASHBOARD READ FAILED for {survey_name}, event_date={event_date}, path={dashboard_path}: {e}")
+        raise
+
+
 def read_parquet_df(bucket, prefix):
     """
     Reads a Curated/Sentiment Parquet partition via Spark, restricted to
@@ -336,7 +402,6 @@ def read_parquet_df(bucket, prefix):
 def read_csv_df(bucket, prefix):
     """
     Reads quarantine (removed_records) data via Spark's CSV reader.
-    CONFIRMED: quarantine is written as CSV, not Parquet.
     Returns None if the partition has no data.
     """
     if not partition_has_data(bucket, prefix):
@@ -371,9 +436,11 @@ def write_dynamodb_summary(summary):
             "raw_count": summary["raw_count"],
             "curated_count": summary["curated_count"],
             "sentiment_count": summary["sentiment_count"],
+            "dashboard_count": summary["dashboard_count"],
             "removed_count": summary["removed_count"],
             "unaccounted_count": summary["unaccounted_count"],
             "raw_curated_mismatch": summary["raw_curated_mismatch"],
+            "dashboard_curated_mismatch": summary["dashboard_curated_mismatch"],
             "pipeline_status": summary.get("pipeline_status", "ACTIVE"),
             "s3_report_path": summary["s3_report_path"],
             "generated_at": summary["generated_at"],
@@ -387,10 +454,9 @@ def write_dynamodb_summary(summary):
 
 def reconcile_raw_only_survey(survey_config, event_date, raw_count):
     """
-    Handles surveys not yet wired into Sentiment. sentiment_count/
-    removed_count/unaccounted_count are Python None (-> JSON null), NOT
-    the string "N/A" -- keeps those columns a proper nullable int in
-    the unified table's crawled schema.
+    Handles surveys not yet wired into Sentiment/Dashboard.
+    sentiment_count/dashboard_count/removed_count/unaccounted_count are
+    Python None (-> JSON null), NOT the string "N/A".
     """
     survey_name = survey_config["survey_name"]
     curated_folder = survey_config["curated_folder"]
@@ -415,6 +481,8 @@ def reconcile_raw_only_survey(survey_config, event_date, raw_count):
         "curated_count": curated_count,
         "raw_curated_mismatch": raw_curated_mismatch,
         "sentiment_count": None,
+        "dashboard_count": None,
+        "dashboard_curated_mismatch": None,
         "removed_count": None,
         "unaccounted_count": None,
         "reason_breakdown": {},
@@ -445,12 +513,22 @@ def reconcile_active_survey(survey_config, event_date, raw_count):
 
     curated_count = count_df_rows(curated_df)
     sentiment_count = count_df_rows(sentiment_df)
+    dashboard_count = count_dashboard_records(survey_name, event_date)
 
     raw_curated_mismatch = raw_count != curated_count
     if raw_curated_mismatch:
         logger.warning(
             f"{survey_name} {event_date}: RAW/CURATED MISMATCH "
             f"(raw={raw_count}, curated={curated_count})."
+        )
+
+    dashboard_curated_mismatch = (
+        dashboard_count is not None and dashboard_count != curated_count
+    )
+    if dashboard_curated_mismatch:
+        logger.warning(
+            f"{survey_name} {event_date}: DASHBOARD/CURATED MISMATCH "
+            f"(dashboard={dashboard_count}, curated={curated_count})."
         )
 
     if curated_df is not None and sentiment_df is not None:
@@ -498,6 +576,8 @@ def reconcile_active_survey(survey_config, event_date, raw_count):
         "curated_count": curated_count,
         "raw_curated_mismatch": raw_curated_mismatch,
         "sentiment_count": sentiment_count,
+        "dashboard_count": dashboard_count,
+        "dashboard_curated_mismatch": dashboard_curated_mismatch,
         "removed_count": removed_count,
         "unaccounted_count": unaccounted_count,
         "reason_breakdown": reason_breakdown,
