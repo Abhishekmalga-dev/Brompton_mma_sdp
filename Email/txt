@@ -148,3 +148,22 @@ Parquet files already written to S3 are immutable — a new column added going f
 | Downstream BI (Tableau) | No changes to existing dashboards/queries | Every dashboard, Athena view, and Starburst query needs to be rebuilt against the new shared schema |
 | Risk | Low — isolated, incremental | High — single shared table becomes a bottleneck; one bad load can affect all survey types at once |
 
+--------
+Sometimes the same customer survey response arrives to our system more than once — for example, if there's a resend or a retry from the vendor. When that happens, our system needs to pick just one version of that response to keep, so we don't end up with duplicate entries.
+
+The tool we were using to make that choice didn't have a clear rule for which copy to keep when there were two versions of the same response. Most of the time it happened to pick the complete one. But in a small number of cases, it picked an older or incomplete copy instead — one that was missing the actual survey answers (Q1 through Q3) — even though the correct, complete version also existed in our system at the same time.
+
+So the data was never actually lost or corrupted at the source — it was received correctly. It was our own process, when trying to clean up duplicates, that occasionally kept the wrong copy.
+
+The fix:
+
+We changed how the system decides which copy to keep. Instead of leaving that choice up to chance, we added a clear, explicit rule: always keep the most recently received version of a record. Now, whenever duplicates show up, the system checks the timestamp on each one and consistently keeps the newest, most complete version — every time, without exception.
+
+We've tested this against the specific records that were previously affected and confirmed the survey answers now show up correctly.
+
+A couple of notes on how I framed it:
+
+I avoided saying "bug" and instead framed it as "no clear rule" — this keeps it accurate (it wasn't a defect, just missing logic) without getting into deterministic/non-deterministic terminology.
+I kept "the data was never lost at the source" front and center early, since that's usually the first concern a non-technical stakeholder has — did we lose customer data. You confirmed that's not the case, so leading with it defuses that worry immediately.
+
+Want me to adapt this into a short slide-style version (a few bullets) in case this needs to go into a presentation rather than a written explanation?
