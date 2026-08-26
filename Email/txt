@@ -1,16 +1,150 @@
-Subject: RE: NICE | Email Survey Technical Issues
+# CCaaS Survey Data Pipeline
+### Handling Source Survey Question Changes Without a Pipeline Redesign
 
-Hi ,
+**Prepared by:** Abhishek &nbsp;|&nbsp; **Audience:** Architect, Lead &nbsp;|&nbsp; **Date:** August 26, 2026
 
-Thank you for raising this concern.
+---
 
-I want to provide some context on what was communicated on Friday. During my validation, I was checking whether verbatim data exists in the Data Lake for the Email survey — and I did confirm that verbatim records are present. However, I want to clarify that my review at that time was focused on verifying whether the verbatim fields were populated (i.e., not null), and I did not do a full date range analysis to confirm coverage across all recent months. I regret that I did not catch that the data was missing for the period post-April 5th during that review.
+## 1. The Issue
 
-Now that this has been brought to our attention, we are aware that the gap in Email survey records from April 5th onwards is tied to the open technical issue related to the System Separation activities, where customer support cases in DFO were opened with a PSEGLI no-reply email address instead of the customer's actual email address, causing surveys to not reach the intended recipients.
+The source team (NICE CXOne) is planning to update the wording of certain survey questions. As an example, the question currently mapped to column `Q2-Effort_sms` is changing from:
 
-We will ensure that any future validations include a complete date range check to avoid similar miscommunications going forward.
+- **Current:** "How would you rate your satisfaction with the level of effort required to complete your transaction during this visit?"
+- **Proposed:** "How would you rate your satisfaction with the effort required to complete your transaction during this visit?"
 
-Please let us know how you would like us to proceed from the Data Lake side once the upstream issue is investigated and resolved by the respective teams.
+This is a wording-only change. The underlying question, its intent, and its position in the survey (Q2) remain the same. This kind of update is expected to recur over time as the source team refines survey language.
 
-Thank you,
-Abhishek
+In response, a proposal has been raised to redesign the pipeline into a single unified table across all survey types (IVR, SMS, API, Email, Chat), where every survey's second question is generically labelled "Q2" regardless of source survey. This document evaluates that proposal against a smaller, targeted fix and recommends a path forward.
+
+---
+
+## 2. Where the Question Text Lives Today
+
+The question text is stored as a hardcoded literal string, independently, in two separate Glue scripts:
+
+- **Survey Curation job** (`datalake-ccaas-sdap-survey-curation-{ENV}`) — inside a Python dictionary, `SURVEY_QUESTION_FIELDS_RAW`.
+- **Sentiment Raw job** (`datalake-sentiment-analysis-dev`) — inside the per-survey normalize function (e.g. `normalize_api_txn()`), added as a literal column via `F.lit(...)`.
+
+Example of the current implementation in the Sentiment Raw script:
+
+```python
+def normalize_api_txn(df):
+    return df.withColumn("q2_effort_value",
+            F.col("q2_effort_value").cast(DoubleType())) \
+        .withColumn("q2_question_text", F.lit(
+            "How would you rate your satisfaction with the "
+            "level of effort required to complete your "
+            "transaction during this visit"))
+```
+
+The same sentence is typed a second time in the Survey Curation script. This duplication — **not the table structure** — is the actual source of the manual effort every time wording changes.
+
+---
+
+## 3. Why the Unified Table Does Not Solve This
+
+The proposal to map every survey's question to a generic `Q2` in one shared table does not remove the need to update wording. The source system change still has to be captured and mapped into our pipeline somewhere — a unified schema only changes **where** the mapping lives, not **whether** it is needed. The manual effort of updating the mapping is the same under both architectures.
+
+In addition, merging five independent survey schemas (IVR, SMS Transactional, SMS Relational, API Transactional, API Relational) into one physical table introduces cost that a wording change does not require:
+
+- Full redesign of both Glue scripts, all read/write paths, and the DynamoDB tracker logic.
+- Migration or backfill of existing curated and sentiment history into the new shared schema.
+- Rebuild of every downstream Tableau, Power BI, Athena, and Starburst artifact against the new schema.
+- A shared table becomes a single point of failure — a bad load for one survey type risks affecting queries across all survey types.
+
+This is addressed in more detail with a side-by-side comparison in Section 6.
+
+---
+
+## 4. Recommended Approach: Config-Driven Question Mapping (Option B)
+
+Instead of a full pipeline redesign, move the question text out of hardcoded Python strings into a single external configuration file that both Glue scripts read at runtime. This directly targets the actual pain point — duplicated hardcoded text in two places — with no change to table structure, schemas, or downstream consumers.
+
+### 4.1 File Format and Location
+
+A single JSON file stored in the existing curated S3 bucket, under a new config prefix. No new bucket or IAM role is required — the Glue role already has read access to this bucket.
+
+```
+s3://psegli-datalakenonprodli-datalake-curated-dev/ccaas/config/question_text_map.json
+```
+
+Example content:
+
+```json
+{
+  "api_transactional": {
+    "q1_question_text":
+      "How would you rate your overall satisfaction with this visit",
+    "q2_question_text":
+      "How would you rate your satisfaction with the effort required to complete your transaction during this visit",
+    "q3_question_text":
+      "How would you rate your overall satisfaction with the service you receive from PSEG Long Island"
+  },
+  "api_relational": {
+    "q1_question_text":
+      "Enter the reasons for this MyAccount visit",
+    "q2_question_text":
+      "How would you rate your overall satisfaction with this transaction"
+  }
+}
+```
+
+### 4.2 Code Change Required (Both Scripts)
+
+**Before** — one hardcoded `.withColumn()` line per question, per survey type:
+
+```python
+.withColumn("q2_question_text", F.lit(
+    "How would you rate your satisfaction with the level of effort..."))
+```
+
+**After** — a generic loop that reads from the shared config:
+
+```python
+question_text_map = load_question_text_map(
+    CONFIG_BUCKET, "ccaas/config/question_text_map.json")
+
+def normalize_api_txn(df, question_map):
+    for col_name, text in question_map["api_transactional"].items():
+        df = df.withColumn(col_name, F.lit(text))
+    return df
+```
+
+### 4.3 Data Type Within the Config File
+
+The config file only stores question wording — every value in it is a sentence, and therefore naturally and always a string. No casting decision is needed here.
+
+This is a separate concern from the survey **answer** columns (e.g. `q2_effort_value`, `q4_feedback_comment`) stored in the Parquet data, which must keep their correct, specific types (numeric scores as `DoubleType`, free text as `StringType`) so downstream aggregation (`AVG`, YTD trending) and Tableau continue to work correctly. Storing answer values as string "just in case" was evaluated and is **not recommended** — it would break numeric sort/aggregation in and Tableau without solving any real schema problem, since missing-column handling for historical data already works correctly today (Section 5).
+
+---
+
+## 5. Impact on Historical Data
+
+This applies both to a wording change (no new column, no impact at all) and to the related scenario of the source team adding a brand-new question in future (a new column) — addressed here for completeness since it will surface the same way.
+
+### 5.1 Wording Change (the current request)
+
+A wording change only updates the value inside an existing text column. No new column is introduced, no schema changes, and historical Parquet files are completely unaffected.
+
+### 5.2 New Question Added 
+Parquet files already written to S3 are immutable — a new column added going forward does not rewrite historical files. This creates a mix of old files (without the new column) and new files (with it) in the same S3 path, split by date.
+
+- The Glue Crawler detects the new column from the newer files and automatically adds it to the Glue Data Catalog table — no manual Catalog edit is needed.
+- When queried through Starburst, older rows that predate the new column automatically return `NULL` for that column. This is standard, correct behavior for Parquet plus schema-on-read — not a defect and not something we need to build.
+- Aggregate functions (`AVG`, `SUM`, `COUNT`) already skip `NULL`s by default, so YTD/daily aggregates continue to work without additional handling.
+
+**Important:** this NULL-backfill behavior is identical whether we keep five survey-specific tables or move to one unified table. A unified table does not avoid this — if anything, it is worse, because a question asked only on one survey type would show as permanently `NULL` for every other survey type's rows, forever, not just for historical dates. The current per-survey design keeps each new column scoped only to the table where it is actually relevant.
+
+---
+
+## 6. Side-by-Side Comparison
+
+| Aspect | Current Architecture (minor fix) | Proposed Unified Table |
+|---|---|---|
+| Change needed for a wording update | Edit 1 config value (or 2 code lines today) | Same edit still required — a source system wording change must still be mapped somewhere |
+| Code/pipeline impact | No schema change, no table redesign | Full redesign of curation + sentiment scripts, all writes, all reads |
+| Historical data | Untouched, fully compatible | Requires backfill/migration of all existing curated + sentiment history |
+| New question added by source (e.g. NPS) | Adds 1 column to the one relevant survey table; other tables unaffected | Adds 1 column to the shared table; permanently NULL for every survey type that never asks it |
+| Downstream BI (Tableau) | No changes to existing dashboards/queries | Every dashboard, Athena view, and Starburst query needs to be rebuilt against the new shared schema |
+| Risk | Low — isolated, incremental | High — single shared table becomes a bottleneck; one bad load can affect all survey types at once |
+
