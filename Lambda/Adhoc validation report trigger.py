@@ -8,24 +8,34 @@ files, and flags any records that vanished WITHOUT a quarantine entry
 
 Reads Curated/Sentiment Parquet natively via Spark (spark.read.parquet).
 Quarantine (removed_records) is CSV, read via spark.read.csv().
-Dashboard output is a single, always-overwritten CSV per survey (no
-event_date partitioning, no historical versions) -- filtered by its own
-raw_invitation_date column and deduplicated by raw_contact_record_id.
+Dashboard output is a single, always-overwritten CSV per survey --
+filtered by its own raw_invitation_date column (MIXED "M/d/yyyy H:mm"
+and "yyyy-MM-dd HH:mm:ss" formats, handled via coalesce()) and
+deduplicated by raw_contact_record_id.
 
-RAW COUNTING: Raw is repeatedly re-ingested, and a given event_date=X/
-folder can accumulate MULTIPLE files over time. Reads EVERY .json file
-in the folder, filters each by Invitation Date == event_date, combines
-all filtered results, then DEDUPLICATES by Contact Record ID across the
-combined set.
+RAW COUNTING: Deliveries only happen on SOME days, and each delivery's
+file spans a rolling ~7-day window of Invitation Dates. If NO delivery
+landed on a given event_date itself, records for that date can still
+exist -- filed under a LATER delivery's folder. build_raw_counts_for_
+date_range() reads every Raw delivery folder across the FULL target
+date range EXACTLY ONCE, tags every record by its own Invitation Date,
+and returns a single lookup -- avoiding re-reading the same overlapping
+delivery file once per target date. Live mode falls back to a lazy,
+per-date read since dates aren't known upfront there.
 
-DASHBOARD COUNTING: single file per survey, always overwritten in
-place. CONFIRMED via raw-sample-value diagnostic: raw_invitation_date
-contains a MIX of two different formats within the SAME column --
-"M/d/yyyy H:mm" (e.g. "3/27/2026 6:39") and "yyyy-MM-dd HH:mm:ss" (e.g.
-"2026-03-23 16:05:40"). Every earlier single-pattern parse attempt
-silently matched 0 rows because no single format covers the whole
-column. Fixed with coalesce() across both date patterns, so whichever
-format a given row actually uses gets picked up.
+FORCE RERUN: already_reconciled() normally skips any (survey, date)
+combo that already has a DynamoDB row, regardless of whether the
+underlying data or the reconciliation logic changed since that row was
+written. Setting --FORCE_RERUN true bypasses this skip for the current
+run's date list, so already-reconciled dates get recomputed and
+overwritten instead of skipped. Use this when refreshing dates after a
+data reload or a logic fix, when hand-deleting the specific affected
+DynamoDB rows isn't practical. Downsides: recomputes EVERY date in the
+current run's list (not just the ones that actually need it), costs
+full compute even for dates that were already correct, and has no
+per-survey granularity -- for a small number of known-affected dates/
+surveys, deleting just those specific DynamoDB rows before a normal run
+is cheaper and more surgical than a blanket force rerun.
 
 Output: ONE unified table (data_reconciliation_report). Raw-only
 surveys write Python None (-> JSON null) for sentiment_count/
@@ -38,6 +48,9 @@ Job modes (set via job parameters):
                               event_dates.json
     (neither set)             live mode -- each survey resolves its own
                               latest available date independently
+    --FORCE_RERUN true        (optional, any mode) bypass the
+                              already-reconciled skip and recompute
+                              every date in this run's list
 
 Starburst never appears in this script. It only ever sees this
 pipeline's OUTPUT, via the Glue Crawler triggered at the end.
@@ -47,7 +60,7 @@ import sys
 import boto3
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -81,6 +94,7 @@ def _get_optional_arg(name):
 
 EVENT_DATE_PARAM = _get_optional_arg('EVENT_DATE')
 EVENT_DATES_S3_PATH_PARAM = _get_optional_arg('EVENT_DATES_S3_PATH')
+FORCE_RERUN_PARAM = _get_optional_arg('FORCE_RERUN').lower() == 'true'
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -94,6 +108,8 @@ job.init(args['JOB_NAME'], args)
 
 RAW_BUCKET = "psegli-datalakenonprodli-datalake-raw-dev"
 RAW_PREFIX = "ccaas/survey_api_json"
+
+RAW_LOOKBACK_WINDOW_DAYS = 7
 
 CURATED_BUCKET = "psegli-datalakenonprodli-datalake-curated-dev"
 CURATED_PREFIX_BASE = "ccaas"
@@ -111,15 +127,12 @@ RAW_INVITATION_DATE_FIELD = "Invitation Date"
 CONTACT_RECORD_ID_COLUMN = "contact_record_id"
 REMOVAL_REASON_COLUMN = "removal_reason"
 
-# Dashboard output -- single always-overwritten CSV per survey, no
-# event_date partitioning at the S3 path level.
 DASHBOARD_BUCKET = "psegli-datalakenonprodli-datalake-temp-dev"
 DASHBOARD_PREFIX = "Sentiment_Analysis/dashboard_output"
 
 RAW_DASHBOARD_CONTACT_ID_FIELD = "raw_contact_record_id"
 RAW_DASHBOARD_INVITATION_DATE_FIELD = "raw_invitation_date"
 
-# Exact filenames per survey, confirmed from the dashboard_output folder.
 DASHBOARD_FILE_MAP = {
     "IVR": "ivr_final_output_all_columns_dashboard.csv",
     "API_REL": "api_web_relational_final_output_all_columns_dashboard.csv",
@@ -257,29 +270,115 @@ def get_latest_event_date(bucket, prefix):
     return sorted(dates)[-1] if dates else None
 
 
-def count_all_raw_survey_records(event_date):
-    """
-    Reads EVERY Raw JSON file in this event_date's folder (not just the
-    most recently modified one), filters each by Invitation Date ==
-    event_date, combines all filtered results, then DEDUPLICATES by
-    Contact Record ID across all files combined.
-
-    Returns a dict: {raw_survey_name_lowercase: distinct_count}
-    """
-    prefix = f"{RAW_PREFIX}/event_date={event_date}/"
+def _list_raw_json_keys_for_folder(folder_date):
+    """Lists all .json object keys under one Raw event_date=X/ folder."""
+    prefix = f"{RAW_PREFIX}/event_date={folder_date}/"
     paginator = s3_client.get_paginator("list_objects_v2")
-
-    json_keys = []
+    keys = []
     for page in paginator.paginate(Bucket=RAW_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             if obj["Key"].endswith(".json"):
-                json_keys.append(obj["Key"])
+                keys.append(obj["Key"])
+    return keys
 
-    if not json_keys:
-        logger.warning(f"No Raw files found at all for event_date={event_date}")
+
+def build_raw_counts_for_date_range(all_target_dates):
+    """
+    Reads every Raw delivery folder covering the full target date range
+    EXACTLY ONCE, tags every record by its own Invitation Date, and
+    returns a lookup keyed by (event_date, survey_name_lower) ->
+    distinct_count.
+
+    Returns: dict of {(event_date, survey_name_lower): distinct_count}
+    """
+    if not all_target_dates:
         return {}
 
-    logger.info(f"event_date={event_date}: found {len(json_keys)} Raw file(s) to combine: {json_keys}")
+    folders_to_read = set()
+    for target_date in all_target_dates:
+        base = datetime.strptime(target_date, "%Y-%m-%d")
+        for offset in range(0, RAW_LOOKBACK_WINDOW_DAYS + 1):
+            folders_to_read.add((base + timedelta(days=offset)).strftime("%Y-%m-%d"))
+
+    logger.info(
+        f"Reading {len(folders_to_read)} Raw delivery folder(s) once each, "
+        f"covering {len(all_target_dates)} target date(s)."
+    )
+
+    all_json_keys = []
+    for folder_date in sorted(folders_to_read):
+        all_json_keys.extend(_list_raw_json_keys_for_folder(folder_date))
+
+    if not all_json_keys:
+        logger.warning("No Raw files found across the entire target date range.")
+        return {}
+
+    logger.info(f"Found {len(all_json_keys)} total Raw file(s) to read once each.")
+
+    combined_df = None
+    target_dates_set = set(all_target_dates)
+
+    for key in all_json_keys:
+        raw_path = f"s3://{RAW_BUCKET}/{key}"
+        try:
+            raw_df = spark.read.option("multiLine", "true").json(raw_path)
+
+            tagged_df = (
+                raw_df
+                .withColumn("_invitation_date_str", F.substring(F.col(RAW_INVITATION_DATE_FIELD), 1, 10))
+                .filter(F.col(RAW_INVITATION_DATE_FIELD).isNotNull())
+                .filter(F.trim(F.col(RAW_INVITATION_DATE_FIELD)) != "")
+                .filter(F.col("_invitation_date_str").isin(list(target_dates_set)))
+                .withColumn("_survey_name_lower", F.lower(F.trim(F.col(RAW_SURVEY_TYPE_FIELD))))
+                .select(
+                    F.col(RAW_CONTACT_ID_FIELD).alias("_contact_id"),
+                    "_survey_name_lower",
+                    F.col("_invitation_date_str").alias("_event_date")
+                )
+            )
+
+            combined_df = tagged_df if combined_df is None else combined_df.unionByName(tagged_df)
+
+        except Exception as e:
+            logger.error(f"RAW READ FAILED for path={raw_path}: {e}")
+            raise
+
+    if combined_df is None:
+        return {}
+
+    distinct_df = combined_df.dropDuplicates(["_contact_id"])
+
+    rows = distinct_df.groupBy("_event_date", "_survey_name_lower").count().collect()
+    result = {(row["_event_date"], row["_survey_name_lower"]): row["count"] for row in rows}
+
+    logger.info(f"Built raw count lookup for {len(result)} (event_date, survey) combinations.")
+
+    return result
+
+
+def count_all_raw_survey_records_single_date(event_date):
+    """
+    Fallback for LIVE mode only, where dates aren't known upfront so the
+    bulk lookup can't be pre-built. Searches the RAW_LOOKBACK_WINDOW_DAYS
+    window for just this one date, on demand.
+
+    Returns a dict: {raw_survey_name_lowercase: distinct_count}
+    """
+    base = datetime.strptime(event_date, "%Y-%m-%d")
+    folder_dates = [
+        (base + timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in range(0, RAW_LOOKBACK_WINDOW_DAYS + 1)
+    ]
+
+    json_keys = []
+    for folder_date in folder_dates:
+        json_keys.extend(_list_raw_json_keys_for_folder(folder_date))
+
+    if not json_keys:
+        logger.warning(f"No Raw files found for event_date={event_date} across lookback window {folder_dates}")
+        return {}
+
+    logger.info(f"event_date={event_date}: found {len(json_keys)} Raw file(s) across lookback window")
 
     combined_df = None
 
@@ -326,15 +425,9 @@ def count_dashboard_records(survey_name, event_date):
     filters by raw_invitation_date == event_date, and counts DISTINCT
     raw_contact_record_id.
 
-    CONFIRMED: raw_invitation_date contains a MIX of two different
-    formats within the SAME column -- "M/d/yyyy H:mm" and
-    "yyyy-MM-dd HH:mm:ss". coalesce() tries both date patterns and
-    takes whichever one actually parses for each row.
-
-    This file has no historical versions -- it's always overwritten in
-    place. Reconciliation only ever sees "the current state of this
-    file," which is the correct behavior given how it's maintained
-    upstream.
+    raw_invitation_date contains a MIX of "M/d/yyyy H:mm" and
+    "yyyy-MM-dd HH:mm:ss" formats within the SAME column. coalesce()
+    tries both patterns and takes whichever one actually parses.
 
     Returns the distinct count as an int, or None if the file doesn't
     exist yet for this survey.
@@ -430,6 +523,15 @@ def count_df_rows(df):
 # =============================================================================
 
 def already_reconciled(survey_name, event_date):
+    """
+    Checks whether this survey_name + event_date has already been
+    reconciled. Bypassed entirely when FORCE_RERUN_PARAM is set, so a
+    forced run recomputes and overwrites existing rows instead of
+    skipping them.
+    """
+    if FORCE_RERUN_PARAM:
+        return False
+
     table = dynamodb.Table(DYNAMODB_TABLE_NAME)
     response = table.get_item(
         Key={"event_date": event_date, "survey_type": survey_name}
@@ -438,6 +540,11 @@ def already_reconciled(survey_name, event_date):
 
 
 def write_dynamodb_summary(summary):
+    """
+    put_item() overwrites any existing row for this key automatically --
+    no delete step needed before writing, whether this is a first-time
+    write or a forced recompute of an already-reconciled date.
+    """
     table = dynamodb.Table(DYNAMODB_TABLE_NAME)
     table.put_item(
         Item={
@@ -463,11 +570,6 @@ def write_dynamodb_summary(summary):
 # =============================================================================
 
 def reconcile_raw_only_survey(survey_config, event_date, raw_count):
-    """
-    Handles surveys not yet wired into Sentiment/Dashboard.
-    sentiment_count/dashboard_count/removed_count/unaccounted_count are
-    Python None (-> JSON null), NOT the string "N/A".
-    """
     survey_name = survey_config["survey_name"]
     curated_folder = survey_config["curated_folder"]
 
@@ -631,7 +733,7 @@ def reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date
         logger.info(f"{survey_name}: {event_date} already reconciled, skipping.")
         return None
 
-    logger.info(f"{survey_name}: reconciling event_date={event_date}")
+    logger.info(f"{survey_name}: reconciling event_date={event_date}" + (" [FORCE_RERUN]" if FORCE_RERUN_PARAM else ""))
 
     raw_counts = get_raw_counts_for_date(event_date)
     raw_count = raw_counts.get(survey_config["raw_survey_name"].strip().lower(), 0)
@@ -647,14 +749,6 @@ def reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date
 # =============================================================================
 
 def write_summary_to_s3(summary):
-    """
-    Writes to a SINGLE unified table folder (data_reconciliation_report).
-    event_date and survey_name are excluded from the JSON body -- already
-    encoded in the S3 partition path.
-
-    reason_breakdown is a plain STRING (e.g. "DEDUP_CASE_2: 4", or
-    "NONE"), not an array of structs.
-    """
     key = (
         f"{S3_REPORT_PREFIX}/{REPORT_TABLE_FOLDER}/"
         f"event_date={summary['event_date']}/"
@@ -722,14 +816,29 @@ def trigger_glue_crawler():
 
 def main():
     dates_to_process = resolve_dates_to_process()
-    logger.info(f"Processing {len(dates_to_process)} date(s): mode determined by job parameters.")
+    logger.info(
+        f"Processing {len(dates_to_process)} date(s): mode determined by job parameters. "
+        f"FORCE_RERUN={FORCE_RERUN_PARAM}"
+    )
 
-    raw_counts_cache = {}
+    is_live_mode = dates_to_process == [None]
 
-    def get_raw_counts_for_date(event_date):
-        if event_date not in raw_counts_cache:
-            raw_counts_cache[event_date] = count_all_raw_survey_records(event_date)
-        return raw_counts_cache[event_date]
+    if is_live_mode:
+        raw_counts_cache = {}
+
+        def get_raw_counts_for_date(event_date):
+            if event_date not in raw_counts_cache:
+                raw_counts_cache[event_date] = count_all_raw_survey_records_single_date(event_date)
+            return raw_counts_cache[event_date]
+    else:
+        raw_counts_lookup = build_raw_counts_for_date_range(dates_to_process)
+
+        def get_raw_counts_for_date(event_date):
+            return {
+                survey_key: count
+                for (date_key, survey_key), count in raw_counts_lookup.items()
+                if date_key == event_date
+            }
 
     total_reconciled = 0
     total_skipped = 0
