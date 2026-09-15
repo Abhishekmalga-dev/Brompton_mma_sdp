@@ -87,8 +87,8 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
+from pyspark.sql import functions as F
 
-# Standard Glue job boilerplate -- creates the `spark` object.
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -97,24 +97,48 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 # =============================================================================
-# DEBUG LOGIC -- just look at the raw data, no date filtering, no assumptions
-# =============================================================================
-
 df = spark.read.option("header", True).csv(
     "s3://psegli-datalakenonprodli-datalake-temp-dev/"
     "Sentiment_Analysis/dashboard_output/"
     "sms_web_relational_final_output_all_columns_dashboard.csv"
 )
 
-print("Total row count in file:", df.count())
+TARGET_DATES = ["2026-08-07", "2026-08-09"]  # both known mismatch dates
 
-print("First 20 rows, raw_contact_record_id + raw_invitation_date:")
-df.select("raw_contact_record_id", "raw_invitation_date").show(20, truncate=False)
+for target_date in TARGET_DATES:
+    print(f"\n=== {target_date} ===")
 
-print("Raw repr() of first 10 raw_invitation_date values (shows exact stored text):")
-for row in df.select("raw_invitation_date").limit(10).collect():
-    val = row["raw_invitation_date"]
-    print(repr(val))
+    # Loose match: does the raw text simply CONTAIN this date, in ANY
+    # shape at all (yyyy-MM-dd form OR M/d/yyyy form)? This makes no
+    # assumption about format correctness -- it just asks "does this
+    # date appear in the string, period."
+    yyyy, mm, dd = target_date.split("-")
+    us_style = f"{int(mm)}/{int(dd)}/{yyyy}"  # e.g. "8/7/2026"
+
+    loose_match = df.filter(
+        F.col("raw_invitation_date").contains(target_date) |
+        F.col("raw_invitation_date").contains(us_style)
+    )
+
+    # Actual production logic: the existing two-format coalesce
+    strict_match = df.filter(
+        F.coalesce(
+            F.to_date(F.col("raw_invitation_date"), "M/d/yyyy H:mm"),
+            F.to_date(F.col("raw_invitation_date"), "yyyy-MM-dd HH:mm:ss")
+        ) == F.lit(target_date)
+    )
+
+    print("Loose match count :", loose_match.count())
+    print("Strict/coalesce count:", strict_match.count())
+
+    dropped = loose_match.select("raw_contact_record_id", "raw_invitation_date") \
+        .subtract(strict_match.select("raw_contact_record_id", "raw_invitation_date"))
+
+    print(f"Record(s) dropped for {target_date}:")
+    for row in dropped.collect():
+        print("  contact_record_id:", row["raw_contact_record_id"])
+        print("  raw_invitation_date repr():", repr(row["raw_invitation_date"]))
+        print("  hex bytes:", [hex(ord(c)) for c in row["raw_invitation_date"]])
 
 # =============================================================================
 job.commit()
