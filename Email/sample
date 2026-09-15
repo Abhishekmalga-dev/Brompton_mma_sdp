@@ -1,43 +1,15 @@
-def _parse_invitation_date(date_col):
-    """
-    Normalizes raw_invitation_date across every format variant we've
-    encountered or might reasonably encounter:
-      - "yyyy-MM-dd HH:mm:ss"  (e.g. 2026-08-07 05:42:39)
-      - "yyyy-MM-dd HH:mm"     (same, no seconds)
-      - "M/d/yyyy H:mm:ss"     (e.g. 8/7/2026 5:42:39)
-      - "M/d/yyyy H:mm"        (e.g. 8/7/2026 5:42, no seconds)
-      - "yyyy-MM-dd"           (date only, no time)
-      - "M/d/yyyy"             (date only, no time)
-    coalesce() tries each pattern in order and returns the first one
-    that successfully parses -- any row matching none of these returns
-    NULL, which is intentionally excluded by the isNotNull() filter
-    downstream rather than silently miscounted.
-    """
-    date_part = F.split(date_col, " ").getItem(0)
-    return F.coalesce(
-        F.to_date(date_col, "yyyy-MM-dd HH:mm:ss"),
-        F.to_date(date_col, "yyyy-MM-dd HH:mm"),
-        F.to_date(date_col, "M/d/yyyy H:mm:ss"),
-        F.to_date(date_col, "M/d/yyyy H:mm"),
-        F.to_date(date_part, "yyyy-MM-dd"),
-        F.to_date(date_part, "M/d/yyyy"),
-    )
-
---------------------
-
 def count_dashboard_records(survey_name, event_date):
     """
     Reads the single, always-overwritten dashboard CSV for this survey,
     filters by raw_invitation_date == event_date, and counts DISTINCT
     raw_contact_record_id.
 
-    Date parsing is normalized across every format variant observed
-    across surveys/rows: "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm",
-    "M/d/yyyy H:mm:ss", "M/d/yyyy H:mm", and date-only versions of each.
-    coalesce() tries each in order and keeps the first successful parse
-    per row -- so mixed formats within the same column, or between
-    different survey files, are all handled without needing to know in
-    advance which format a given row uses.
+    Date parsing is normalized across every format variant observed so
+    far via _parse_invitation_date(). Any row whose raw_invitation_date
+    is non-null but fails to parse under every known format is logged
+    explicitly (both the count and the actual raw values) rather than
+    silently dropped -- so a genuine gap in our format coverage shows
+    up as a clear signal instead of a mystery count discrepancy.
 
     Returns the distinct count as an int, or None if the file doesn't
     exist yet for this survey.
@@ -72,9 +44,11 @@ def count_dashboard_records(survey_name, event_date):
         filtered_count = filtered_df.count()
         logger.info(f"{survey_name} {event_date}: {filtered_count} dashboard records matched after date parsing")
 
-        # Log any row that fails to parse under ANY format, so a truly
-        # malformed value doesn't silently vanish from the count.
-        unparsed_count = (
+        # DIAGNOSTIC: find and log the ACTUAL raw values of any row
+        # whose raw_invitation_date is non-null but failed to parse
+        # under every known format -- shows us exactly what format
+        # we're still missing, instead of just a count.
+        unparsed_samples = (
             dashboard_df
             .withColumn(
                 "_invitation_date_parsed",
@@ -82,12 +56,14 @@ def count_dashboard_records(survey_name, event_date):
             )
             .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
             .filter(F.col("_invitation_date_parsed").isNull())
-            .count()
+            .select(RAW_DASHBOARD_CONTACT_ID_FIELD, RAW_DASHBOARD_INVITATION_DATE_FIELD)
+            .collect()
         )
-        if unparsed_count > 0:
+        if unparsed_samples:
             logger.warning(
-                f"{survey_name} {event_date}: {unparsed_count} row(s) in the dashboard file "
-                f"have a non-null raw_invitation_date that failed to parse under any known format."
+                f"{survey_name} {event_date}: {len(unparsed_samples)} row(s) in the dashboard file "
+                f"have a non-null raw_invitation_date that failed to parse under any known format. "
+                f"Values = {[row.asDict() for row in unparsed_samples]}"
             )
 
         distinct_count = (
