@@ -8,11 +8,15 @@ def count_dashboard_records(survey_name, event_date):
     "yyyy-MM-dd HH:mm:ss" formats within the SAME column. coalesce()
     tries both patterns and takes whichever one actually parses.
 
-    DIAGNOSTIC: logs a row-by-row parse comparison for every row whose
-    raw value contains this event_date's unpadded month/day fragment --
-    shows contact_id, raw value, and every parse stage side by side, so
-    a single-row parsing discrepancy can be spotted directly instead of
-    only seeing the final count is off.
+    DIAGNOSTIC: logs the first 20 rows of the column completely
+    UNFILTERED, alongside every parse stage. An earlier version of this
+    diagnostic used a .contains() substring filter to narrow down to
+    matching rows first, but that filter itself returned zero rows on a
+    594-row file where matching rows were confirmed to exist by direct
+    inspection -- so the filter was the bug, not the data. Removing the
+    filter entirely avoids trusting any conditional logic that could
+    itself be wrong; this just shows the literal raw values and how
+    they parse, full stop.
 
     Returns the distinct count as an int, or None if the file doesn't
     exist yet for this survey.
@@ -34,33 +38,20 @@ def count_dashboard_records(survey_name, event_date):
         total_records = dashboard_df.count()
         logger.info(f"{survey_name} {event_date}: dashboard file {dashboard_path} has {total_records} total records")
 
-        # DIAGNOSTIC: row-by-row parse comparison. Build an unpadded
-        # "M/D/" match string (e.g. "8/7/", matching "8/7/2026", NOT
-        # "08/07/") since raw values are unpadded.
-        month_num = str(int(event_date[5:7]))
-        day_num = str(int(event_date[8:10]))
-        match_fragment = f"{month_num}/{day_num}/"
-
-        debug_rows = (
+        # DIAGNOSTIC: unconditional sample, no filter of any kind.
+        raw_sample = (
             dashboard_df
+            .select(RAW_DASHBOARD_CONTACT_ID_FIELD, RAW_DASHBOARD_INVITATION_DATE_FIELD)
             .withColumn("_date_part", F.split(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), " ").getItem(0))
             .withColumn("_parsed_slash", F.to_date(F.col("_date_part"), "M/d/yyyy"))
             .withColumn("_parsed_dash", F.to_date(F.col("_date_part"), "yyyy-MM-dd"))
             .withColumn("_final_parsed", F.coalesce(F.col("_parsed_slash"), F.col("_parsed_dash")))
-            .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).contains(match_fragment))
-            .select(
-                RAW_DASHBOARD_CONTACT_ID_FIELD,
-                RAW_DASHBOARD_INVITATION_DATE_FIELD,
-                "_date_part",
-                "_parsed_slash",
-                "_parsed_dash",
-                "_final_parsed"
-            )
+            .limit(20)
             .collect()
         )
         logger.info(
-            f"{survey_name} {event_date}: DEBUG row-by-row parse = "
-            f"{[row.asDict() for row in debug_rows]}"
+            f"{survey_name} {event_date}: DEBUG unfiltered sample (first 20 rows) = "
+            f"{[row.asDict() for row in raw_sample]}"
         )
 
         date_only = F.split(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), " ").getItem(0)
