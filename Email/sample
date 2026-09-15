@@ -81,8 +81,28 @@ def count_dashboard_records(survey_name, event_date):
         raise
 
 ----------------
-
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
 from pyspark.sql import functions as F
+
+# Standard Glue job boilerplate -- this is what actually creates the
+# `spark` object. Without this, `spark` simply does not exist in a
+# plain .py script submitted as a Glue job -- it's not implicit the
+# way it is in a Glue Studio notebook cell.
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# =============================================================================
+# DEBUG LOGIC STARTS HERE -- unchanged from before
+# =============================================================================
 
 TARGET_DATE = "2026-08-07"  # <-- set to the actual event_date you're debugging
 
@@ -92,13 +112,14 @@ df = spark.read.option("header", True).csv(
     "sms_web_relational_final_output_all_columns_dashboard.csv"
 )
 
-# Candidate set A: loose STRING match on the date portion only.
-# This does NOT use to_date() at all, so it can't be fooled by a
-# format mismatch -- it just checks if the raw text starts with "8/7/2026".
-candidate_a = df.filter(F.col("raw_invitation_date").startswith(TARGET_DATE.split("-")[1].lstrip("0") + "/" + TARGET_DATE.split("-")[2].lstrip("0") + "/" + TARGET_DATE.split("-")[0]))
+candidate_a = df.filter(
+    F.col("raw_invitation_date").startswith(
+        TARGET_DATE.split("-")[1].lstrip("0") + "/" +
+        TARGET_DATE.split("-")[2].lstrip("0") + "/" +
+        TARGET_DATE.split("-")[0]
+    )
+)
 
-# Candidate set B: the ACTUAL production logic -- to_date() with the
-# strict format string, same as count_dashboard_records() uses today.
 candidate_b = df.filter(
     F.to_date(F.col("raw_invitation_date"), "M/d/yyyy H:mm") == F.lit(TARGET_DATE)
 )
@@ -106,18 +127,19 @@ candidate_b = df.filter(
 print("String-match count :", candidate_a.count())
 print("to_date() count    :", candidate_b.count())
 
-# The record(s) present in A but missing from B are exactly the ones
-# silently dropped by the production filter logic.
 dropped = candidate_a.select("raw_contact_record_id", "raw_invitation_date") \
     .subtract(candidate_b.select("raw_contact_record_id", "raw_invitation_date"))
 
 print("Dropped record(s):")
 dropped.show(truncate=False)
 
-# Print the RAW bytes of that one date string -- this will expose
-# invisible characters (non-breaking space \xa0, stray \r, a trailing
-# tab, etc.) that both Excel and a normal .show() would hide.
 for row in dropped.collect():
     raw_val = row["raw_invitation_date"]
-    print(repr(raw_val))          # shows hidden characters explicitly
-    print([hex(ord(c)) for c in raw_val])   # shows every character's exact code point
+    print(repr(raw_val))
+    print([hex(ord(c)) for c in raw_val])
+
+# =============================================================================
+# DEBUG LOGIC ENDS -- standard Glue job close
+# =============================================================================
+
+job.commit()
