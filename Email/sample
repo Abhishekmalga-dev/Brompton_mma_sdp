@@ -81,18 +81,14 @@ def count_dashboard_records(survey_name, event_date):
         raise
 
 ----------------
+
 import sys
-from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql import functions as F
 
-# Standard Glue job boilerplate -- this is what actually creates the
-# `spark` object. Without this, `spark` simply does not exist in a
-# plain .py script submitted as a Glue job -- it's not implicit the
-# way it is in a Glue Studio notebook cell.
+# Standard Glue job boilerplate -- creates the `spark` object.
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -101,10 +97,8 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 # =============================================================================
-# DEBUG LOGIC STARTS HERE -- unchanged from before
+# DEBUG LOGIC -- just look at the raw data, no date filtering, no assumptions
 # =============================================================================
-
-TARGET_DATE = "2026-08-07"  # <-- set to the actual event_date you're debugging
 
 df = spark.read.option("header", True).csv(
     "s3://psegli-datalakenonprodli-datalake-temp-dev/"
@@ -112,34 +106,15 @@ df = spark.read.option("header", True).csv(
     "sms_web_relational_final_output_all_columns_dashboard.csv"
 )
 
-candidate_a = df.filter(
-    F.col("raw_invitation_date").startswith(
-        TARGET_DATE.split("-")[1].lstrip("0") + "/" +
-        TARGET_DATE.split("-")[2].lstrip("0") + "/" +
-        TARGET_DATE.split("-")[0]
-    )
-)
+print("Total row count in file:", df.count())
 
-candidate_b = df.filter(
-    F.to_date(F.col("raw_invitation_date"), "M/d/yyyy H:mm") == F.lit(TARGET_DATE)
-)
+print("First 20 rows, raw_contact_record_id + raw_invitation_date:")
+df.select("raw_contact_record_id", "raw_invitation_date").show(20, truncate=False)
 
-print("String-match count :", candidate_a.count())
-print("to_date() count    :", candidate_b.count())
-
-dropped = candidate_a.select("raw_contact_record_id", "raw_invitation_date") \
-    .subtract(candidate_b.select("raw_contact_record_id", "raw_invitation_date"))
-
-print("Dropped record(s):")
-dropped.show(truncate=False)
-
-for row in dropped.collect():
-    raw_val = row["raw_invitation_date"]
-    print(repr(raw_val))
-    print([hex(ord(c)) for c in raw_val])
+print("Raw repr() of first 10 raw_invitation_date values (shows exact stored text):")
+for row in df.select("raw_invitation_date").limit(10).collect():
+    val = row["raw_invitation_date"]
+    print(repr(val))
 
 # =============================================================================
-# DEBUG LOGIC ENDS -- standard Glue job close
-# =============================================================================
-
 job.commit()
