@@ -1,81 +1,96 @@
-Context: I'm building a Snowflake data pipeline for the "wrapup_summary" project, following our team's established RAW -> WORK -> FINAL pattern. Generate 4 SQL scripts as described below. Follow our conventions: land raw data as VARIANT/VARCHAR first, use step markers for restartability, and use SP_APPLY_GRANT for standard grants at the end of DDL scripts.
+def count_dashboard_records(survey_name, event_date):
+    """
+    Reads the single, always-overwritten dashboard CSV for this survey,
+    filters by raw_invitation_date == event_date, and counts DISTINCT
+    raw_contact_record_id.
 
-SOURCE JSON STRUCTURE (from Service Bus message, landed in raw table as VARIANT column named json_body):
-{
-  "conversation_id": string,
-  "summary": {
-    "inquiries": [
-      {
-        "member_id": string,
-        "member_suffix": string,
-        "member_name": string,
-        "inquiry_number": string,
-        "inquiry_role": string,
-        "inquiry_parent_number": string|null,
-        "classification": string,
-        "intents": [ { "id": number, "label": string } ],
-        "description": string,
-        "resolution": string,
-        "status": string,
-        "inquiry_summary": string,
-        "key_points": [ string ],
-        "topics_covered": [ string ]
-      }
-    ]
-  },
-  "generated_at": timestamp,
-  "model_version": string,
-  "token_usage": { "prompt_tokens": number, "completion_tokens": number, "total_tokens": number }
-}
+    raw_invitation_date contains a MIX of "M/d/yyyy H:mm" and
+    "yyyy-MM-dd HH:mm:ss" formats within the SAME column. coalesce()
+    tries both patterns and takes whichever one actually parses.
 
-TARGET TABLE SHAPE (5 entities, 1 header : many-inquiries : many-intents/key_points/topics fan-out):
-1. conversation  - grain: 1 row per conversation_id. Columns: conversation_id (PK), message_id, sequence_number, generated_at, model_version, prompt_tokens, completion_tokens, total_tokens, updated_on
-2. inquiry        - grain: 1 row per inquiry. Columns: inquiry_id (deterministic surrogate PK - hash of conversation_id + array index, NOT random, so the value is reproducible across runs), conversation_id (FK), inquiry_number, inquiry_role, inquiry_parent_number, classification, description, resolution, status, inquiry_summary, updated_on
-   - Do NOT include member_id, member_suffix, or member_name columns on this table (removed per review feedback from Suraj on 7/31/2026 - these fields should not be persisted here).
-   - Include a MEME_CK column and make it NULLABLE (per Suraj's review feedback - confirm exact column name/definition against the existing ASDT_WRAPUP_SUMMARY DDL before finalizing, as this may already exist as a composite/check key column in the current schema).
-3. inquiry_intent - grain: 1 row per intent. Columns: inquiry_id (FK), intent_id, intent_label, updated_on
-4. inquiry_key_point - grain: 1 row per key point. Columns: inquiry_id (FK), key_point_seq, key_point_text, updated_on
-5. inquiry_topic  - grain: 1 row per topic. Columns: inquiry_id (FK), topic_seq, topic_text, updated_on
+    DIAGNOSTIC: logs a row-by-row parse comparison for every row whose
+    raw value contains this event_date's unpadded month/day fragment --
+    shows contact_id, raw value, and every parse stage side by side, so
+    a single-row parsing discrepancy can be spotted directly instead of
+    only seeing the final count is off.
 
-TIMESTAMP REQUIREMENT: In the FINAL tables (asdt_ prefix) only, all timestamp columns (generated_at, updated_on, and any other date/time column) must be declared as TIMESTAMP_NTZ, and all values inserted into them must be explicitly cast with ::TIMESTAMP_NTZ (or TRY_TO_TIMESTAMP_NTZ where parsing from string/VARIANT). Work tables (asdw_ prefix) can retain the raw parsed type if it differs, but the final INSERT into the FINAL table must cast to TIMESTAMP_NTZ.
+    Returns the distinct count as an int, or None if the file doesn't
+    exist yet for this survey.
+    """
+    filename = DASHBOARD_FILE_MAP.get(survey_name)
+    if filename is None:
+        return None
 
-NAMING CONVENTION (matches file naming pattern in our OneNote doc):
-- Work tables (prefix asdw_): asdw_wrapup_summary_conversation_load, asdw_wrapup_summary_inquiry_load, asdw_wrapup_summary_inquiry_intent_load, asdw_wrapup_summary_inquiry_key_point_load, asdw_wrapup_summary_inquiry_topic_load
-- Final tables (prefix asdt_): asdt_wrapup_summary_conversation, asdt_wrapup_summary_inquiry, asdt_wrapup_summary_inquiry_intent, asdt_wrapup_summary_inquiry_key_point, asdt_wrapup_summary_inquiry_topic
-- Raw table: assumed already created, referenced as asd_wrapup_summary_raw (adjust name if different in this repo)
+    key = f"{DASHBOARD_PREFIX}/{filename}"
 
-GENERATE THESE 4 FILES:
+    if not partition_has_data(DASHBOARD_BUCKET, key):
+        logger.warning(f"{survey_name}: dashboard file not found at s3://{DASHBOARD_BUCKET}/{key}")
+        return None
 
-File 1: asd_wrapup_summary_load_raw_table.sql
-- Loads the raw JSON payload from Blob storage into the raw table's VARIANT column via COPY INTO, following the same pattern as our other shared_snowSQL-based raw loads.
+    dashboard_path = f"s3://{DASHBOARD_BUCKET}/{key}"
 
-File 2: asd_wrapup_summary_truncate_work_tables.sql
-- TRUNCATE TABLE statements for the 5 work tables listed above, in child-to-parent order (intents/key_points/topics first, then inquiry, then conversation) to avoid orphaned-looking state mid-run.
+    try:
+        dashboard_df = spark.read.option("header", "true").csv(dashboard_path)
+        total_records = dashboard_df.count()
+        logger.info(f"{survey_name} {event_date}: dashboard file {dashboard_path} has {total_records} total records")
 
-File 3: asd_wrapup_summary_populate_work_tables.sql
-- INSERT INTO each of the 5 work tables, SELECTing from the raw table's json_body VARIANT column.
-- Use LATERAL FLATTEN to unnest summary:inquiries, then a nested LATERAL FLATTEN on each of intents, key_points, topics_covered within that same inquiry row.
-- Generate inquiry_id deterministically, e.g. HASH(conversation_id, inquiry_value.index) or MD5(conversation_id || '-' || inquiry_value.index::string), and reuse that same expression when populating inquiry_intent, inquiry_key_point, inquiry_topic so the FK lines up.
-- Do NOT select member_id, member_suffix, or member_name into the inquiry work table.
-- Cast all fields out of VARIANT explicitly (::STRING, ::NUMBER, etc.); do not leave typed columns as VARIANT.
-- Use TRY_TO_TIMESTAMP_NTZ for generated_at/enqueued_time_utc; note we use TRY_TO_DATE (not TRY_TO_TIMESTAMP_NTZ) for date-only columns elsewhere, but these are timestamps so TRY_TO_TIMESTAMP_NTZ is correct here.
-- Populate updated_on as CURRENT_TIMESTAMP()::TIMESTAMP_NTZ on every row.
+        # DIAGNOSTIC: row-by-row parse comparison. Build an unpadded
+        # "M/D/" match string (e.g. "8/7/", matching "8/7/2026", NOT
+        # "08/07/") since raw values are unpadded.
+        month_num = str(int(event_date[5:7]))
+        day_num = str(int(event_date[8:10]))
+        match_fragment = f"{month_num}/{day_num}/"
 
-File 4: asd_wrapup_summary_load_final_tables.sql
-- For each of the 5 tables, trim trailing spaces on all string columns in the work table first (UPDATE work table SET col = RTRIM(col)).
-- Then INSERT INTO the final table SELECT * FROM the work table, explicitly casting any timestamp column to ::TIMESTAMP_NTZ, using an anti-join (LEFT JOIN final ON PK columns AND UPDATED_ON WHERE final.PK IS NULL) so that rows whose PK + UPDATED_ON combination already exists in the final table are skipped.
-- Do this in parent-to-child order (conversation, then inquiry, then intent/key_point/topic) since child FINAL tables reference inquiry_id from the parent.
-- PK for the anti-join purposes: conversation -> conversation_id; inquiry -> inquiry_id; inquiry_intent -> (inquiry_id, intent_id); inquiry_key_point -> (inquiry_id, key_point_seq); inquiry_topic -> (inquiry_id, topic_seq).
+        debug_rows = (
+            dashboard_df
+            .withColumn("_date_part", F.split(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), " ").getItem(0))
+            .withColumn("_parsed_slash", F.to_date(F.col("_date_part"), "M/d/yyyy"))
+            .withColumn("_parsed_dash", F.to_date(F.col("_date_part"), "yyyy-MM-dd"))
+            .withColumn("_final_parsed", F.coalesce(F.col("_parsed_slash"), F.col("_parsed_dash")))
+            .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).contains(match_fragment))
+            .select(
+                RAW_DASHBOARD_CONTACT_ID_FIELD,
+                RAW_DASHBOARD_INVITATION_DATE_FIELD,
+                "_date_part",
+                "_parsed_slash",
+                "_parsed_dash",
+                "_final_parsed"
+            )
+            .collect()
+        )
+        logger.info(
+            f"{survey_name} {event_date}: DEBUG row-by-row parse = "
+            f"{[row.asDict() for row in debug_rows]}"
+        )
 
-Match the SQL style, comment headers, and step-marker/logging conventions used elsewhere in this repo (see shared_snowsql.py and existing *_load_final_tables.sql files as style reference).
+        date_only = F.split(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), " ").getItem(0)
 
+        filtered_df = (
+            dashboard_df
+            .withColumn(
+                "_invitation_date_parsed",
+                F.coalesce(
+                    F.to_date(date_only, "M/d/yyyy"),
+                    F.to_date(date_only, "yyyy-MM-dd"),
+                )
+            )
+            .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
+            .filter(F.col("_invitation_date_parsed") == F.to_date(F.lit(event_date), "yyyy-MM-dd"))
+        )
 
-------
-{
-  "source": ["aws.states"],
-  "detail-type": ["Step Functions Execution Status Change"],
-  "detail": {
-    "status": ["SUCCEEDED"],
-    "stateMachineArn": ["arn:aws:states:us-east-1:0532-3486-1925:stateMachine:datalake-ccaas-sdap-survey-monitor-dev"]
-  }
-}
+        filtered_count = filtered_df.count()
+        logger.info(f"{survey_name} {event_date}: {filtered_count} dashboard records matched after date parsing")
+
+        distinct_count = (
+            filtered_df
+            .select(RAW_DASHBOARD_CONTACT_ID_FIELD)
+            .distinct()
+            .count()
+        )
+
+        logger.info(f"{survey_name} {event_date}: dashboard_count={distinct_count} (from {dashboard_path})")
+        return distinct_count
+
+    except Exception as e:
+        logger.error(f"DASHBOARD READ FAILED for {survey_name}, event_date={event_date}, path={dashboard_path}: {e}")
+        raise
