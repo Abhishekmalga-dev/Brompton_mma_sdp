@@ -4,141 +4,31 @@ def count_dashboard_records(survey_name, event_date):
     filters by raw_invitation_date == event_date, and counts DISTINCT
     raw_contact_record_id.
 
-    Date parsing is normalized across every format variant observed so
-    far via _parse_invitation_date(). Any row whose raw_invitation_date
-    is non-null but fails to parse under every known format is logged
-    explicitly (both the count and the actual raw values) rather than
-    silently dropped -- so a genuine gap in our format coverage shows
-    up as a clear signal instead of a mystery count discrepancy.
-
-    Returns the distinct count as an int, or None if the file doesn't
-    exist yet for this survey.
+    CONFIRMED ROOT CAUSE (2026-09-15): the default CSV reader (no
+    multiLine/quote/escape options) mis-parses row boundaries whenever a
+    field contains an embedded quote or newline character (e.g. free-text
+    notes/comments fields) -- shifting columns and silently corrupting or
+    dropping individual records. This is invisible in Excel, which parses
+    quoted CSV structure correctly and never revealed the problem when
+    manually inspected. Fixed by reading with multiLine=True and explicit
+    quote/escape handling, matching Spark's proper CSV/RFC-4180 parsing.
     """
-    filename = DASHBOARD_FILE_MAP.get(survey_name)
-    if filename is None:
-        return None
-
-    key = f"{DASHBOARD_PREFIX}/{filename}"
-
-    if not partition_has_data(DASHBOARD_BUCKET, key):
-        logger.warning(f"{survey_name}: dashboard file not found at s3://{DASHBOARD_BUCKET}/{key}")
-        return None
-
-    dashboard_path = f"s3://{DASHBOARD_BUCKET}/{key}"
-
-    try:
-        dashboard_df = spark.read.option("header", "true").csv(dashboard_path)
-        total_records = dashboard_df.count()
-        logger.info(f"{survey_name} {event_date}: dashboard file {dashboard_path} has {total_records} total records")
-
-        filtered_df = (
-            dashboard_df
-            .withColumn(
-                "_invitation_date_parsed",
-                _parse_invitation_date(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD))
-            )
-            .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
-            .filter(F.col("_invitation_date_parsed") == F.to_date(F.lit(event_date), "yyyy-MM-dd"))
-        )
-
-        filtered_count = filtered_df.count()
-        logger.info(f"{survey_name} {event_date}: {filtered_count} dashboard records matched after date parsing")
-
-        # DIAGNOSTIC: find and log the ACTUAL raw values of any row
-        # whose raw_invitation_date is non-null but failed to parse
-        # under every known format -- shows us exactly what format
-        # we're still missing, instead of just a count.
-        unparsed_samples = (
-            dashboard_df
-            .withColumn(
-                "_invitation_date_parsed",
-                _parse_invitation_date(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD))
-            )
-            .filter(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD).isNotNull())
-            .filter(F.col("_invitation_date_parsed").isNull())
-            .select(RAW_DASHBOARD_CONTACT_ID_FIELD, RAW_DASHBOARD_INVITATION_DATE_FIELD)
-            .collect()
-        )
-        if unparsed_samples:
-            logger.warning(
-                f"{survey_name} {event_date}: {len(unparsed_samples)} row(s) in the dashboard file "
-                f"have a non-null raw_invitation_date that failed to parse under any known format. "
-                f"Values = {[row.asDict() for row in unparsed_samples]}"
-            )
-
-        distinct_count = (
-            filtered_df
-            .select(RAW_DASHBOARD_CONTACT_ID_FIELD)
-            .distinct()
-            .count()
-        )
-
-        logger.info(f"{survey_name} {event_date}: dashboard_count={distinct_count} (from {dashboard_path})")
-        return distinct_count
-
-    except Exception as e:
-        logger.error(f"DASHBOARD READ FAILED for {survey_name}, event_date={event_date}, path={dashboard_path}: {e}")
-        raise
-
-----------------
-
-import sys
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-from pyspark.sql import functions as F
-
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
-
-# =============================================================================
-df = spark.read.option("header", True).csv(
-    "s3://psegli-datalakenonprodli-datalake-temp-dev/"
-    "Sentiment_Analysis/dashboard_output/"
-    "sms_web_relational_final_output_all_columns_dashboard.csv"
-)
-
-TARGET_DATES = ["2026-08-07", "2026-08-09"]  # both known mismatch dates
-
-for target_date in TARGET_DATES:
-    print(f"\n=== {target_date} ===")
-
-    # Loose match: does the raw text simply CONTAIN this date, in ANY
-    # shape at all (yyyy-MM-dd form OR M/d/yyyy form)? This makes no
-    # assumption about format correctness -- it just asks "does this
-    # date appear in the string, period."
-    yyyy, mm, dd = target_date.split("-")
-    us_style = f"{int(mm)}/{int(dd)}/{yyyy}"  # e.g. "8/7/2026"
-
-    loose_match = df.filter(
-        F.col("raw_invitation_date").contains(target_date) |
-        F.col("raw_invitation_date").contains(us_style)
+    file_key = f"{DASHBOARD_PREFIX}/{DASHBOARD_FILE_MAP[survey_name]}"
+    df = (
+        spark.read
+            .option("header", True)
+            .option("multiLine", True)
+            .option("quote", '"')
+            .option("escape", '"')
+            .option("mode", "PERMISSIVE")
+            .csv(f"s3://{DASHBOARD_BUCKET}/{file_key}")
     )
 
-    # Actual production logic: the existing two-format coalesce
-    strict_match = df.filter(
+    filtered = df.filter(
         F.coalesce(
-            F.to_date(F.col("raw_invitation_date"), "M/d/yyyy H:mm"),
-            F.to_date(F.col("raw_invitation_date"), "yyyy-MM-dd HH:mm:ss")
-        ) == F.lit(target_date)
+            F.to_date(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), "M/d/yyyy H:mm"),
+            F.to_date(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), "yyyy-MM-dd HH:mm:ss")
+        ) == F.lit(event_date)
     )
 
-    print("Loose match count :", loose_match.count())
-    print("Strict/coalesce count:", strict_match.count())
-
-    dropped = loose_match.select("raw_contact_record_id", "raw_invitation_date") \
-        .subtract(strict_match.select("raw_contact_record_id", "raw_invitation_date"))
-
-    print(f"Record(s) dropped for {target_date}:")
-    for row in dropped.collect():
-        print("  contact_record_id:", row["raw_contact_record_id"])
-        print("  raw_invitation_date repr():", repr(row["raw_invitation_date"]))
-        print("  hex bytes:", [hex(ord(c)) for c in row["raw_invitation_date"]])
-
-# =============================================================================
-job.commit()
+    return filtered.select(RAW_DASHBOARD_CONTACT_ID_FIELD).distinct().count()
