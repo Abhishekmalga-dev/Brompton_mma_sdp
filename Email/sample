@@ -19,22 +19,33 @@ curated_df = spark.read.parquet(
     f"ccaas/survey_sms_web_relational/event_date={TARGET_DATE}/"
 )
 
-print("=== Curated schema ===")
-curated_df.printSchema()
-
-print(f"\n=== Curated: first 5 rows for event_date={TARGET_DATE}, ALL columns ===")
-curated_df.show(5, truncate=False)
-
-raw_df = spark.read.option("multiLine", "true").json(
-    f"s3://psegli-datalakenonprodli-datalake-raw-dev/"
-    f"ccaas/survey_api_json/event_date={TARGET_DATE}/"
+# Only the 5 columns that actually matter for this question -- narrow
+# enough to read as a clean table instead of a wrapped, unreadable dump.
+narrowed = curated_df.select(
+    "contact_record_id",
+    "invitation_date",
+    "response_received_date",
+    "response_collected_date",
+    "survey_event_date"
 )
 
-print("\n=== Raw schema ===")
-raw_df.printSchema()
+print(f"=== Curated event_date={TARGET_DATE}: date-field comparison, {narrowed.count()} total rows ===")
+narrowed.show(30, truncate=False)
 
-print(f"\n=== Raw: first 5 rows, ALL columns ===")
-raw_df.show(5, truncate=False)
+# Direct, unambiguous tallies: for THIS partition, how many rows'
+# invitation_date actually equals the partition date, vs how many
+# rows' response_received_date equals it? Whichever count is closer
+# to the true row count is the field Curated is actually keyed on.
+from pyspark.sql import functions as F
+
+invitation_match = narrowed.filter(F.col("invitation_date").startswith(TARGET_DATE)).count()
+response_received_match = narrowed.filter(F.col("response_received_date").startswith(TARGET_DATE)).count()
+response_collected_match = narrowed.filter(F.col("response_collected_date").startswith(TARGET_DATE)).count()
+
+print(f"\nTotal rows in partition: {narrowed.count()}")
+print(f"Rows where invitation_date starts with {TARGET_DATE}: {invitation_match}")
+print(f"Rows where response_received_date starts with {TARGET_DATE}: {response_received_match}")
+print(f"Rows where response_collected_date starts with {TARGET_DATE}: {response_collected_match}")
 
 # =============================================================================
 job.commit()
