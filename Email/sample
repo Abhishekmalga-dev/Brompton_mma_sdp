@@ -143,3 +143,68 @@ def list_event_date_partitions(bucket, prefix):
 
 
 ------------------------------
+
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# =============================================================================
+TARGET_DATE = "2026-08-07"  # a date we've already investigated -- known quantity
+
+# -----------------------------------------------------------------------
+# STEP 1: What does Curated's schema actually look like? Does it carry
+# a response-received-date field directly, or only contact_record_id
+# and the fields we already know about?
+# -----------------------------------------------------------------------
+curated_df = spark.read.parquet(
+    f"s3://psegli-datalakenonprodli-datalake-curated-dev/"
+    f"ccaas/survey_sms_web_relational/event_date={TARGET_DATE}/"
+)
+
+print("=== Curated schema ===")
+curated_df.printSchema()
+
+print(f"\n=== Curated: first 10 rows for event_date={TARGET_DATE}, ALL columns ===")
+curated_df.show(10, truncate=False)
+
+# -----------------------------------------------------------------------
+# STEP 2: Pull 10 contact_record_ids from this Curated partition, then
+# go find those SAME records in Raw and print every date-like field
+# Raw has for them -- Invitation Date, and whatever the actual
+# response-received field is called (schema-check first, don't assume
+# the name).
+# -----------------------------------------------------------------------
+sample_ids = [
+    row["contact_record_id"]
+    for row in curated_df.select("contact_record_id").distinct().limit(10).collect()
+]
+print(f"\n=== Sample contact_record_ids from Curated event_date={TARGET_DATE} ===")
+print(sample_ids)
+
+# Read a wide net of Raw folders so we don't have to guess which one
+# holds these records -- reads every event_date= partition under the
+# prefix in one shot via Spark's own partition discovery.
+raw_df = spark.read.option("multiLine", "true").json(
+    "s3://psegli-datalakenonprodli-datalake-raw-dev/ccaas/survey_api_json/"
+)
+
+print("\n=== Raw schema (looking for the actual response-received field name) ===")
+raw_df.printSchema()
+
+matching_raw = raw_df.filter(F.col(RAW_CONTACT_ID_FIELD).isin(sample_ids))
+
+print(f"\n=== Raw records matching those {len(sample_ids)} contact_record_ids, ALL columns ===")
+matching_raw.show(20, truncate=False)
+
+# =============================================================================
+job.commit()
