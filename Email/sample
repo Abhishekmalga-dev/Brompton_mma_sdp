@@ -1,34 +1,145 @@
-def count_dashboard_records(survey_name, event_date):
+def build_raw_counts_for_date_range(all_target_dates, forward_window_days=RAW_LOOKBACK_WINDOW_DAYS, max_search_days=120):
     """
-    Reads the single, always-overwritten dashboard CSV for this survey,
-    filters by raw_invitation_date == event_date, and counts DISTINCT
-    raw_contact_record_id.
+    Reads every Raw delivery folder covering the full target date range,
+    tags every record by its own Invitation Date, and returns a lookup
+    keyed by (event_date, survey_name_lower) -> distinct_count.
 
-    CONFIRMED ROOT CAUSE (2026-09-15): the default CSV reader (no
-    multiLine/quote/escape options) mis-parses row boundaries whenever a
-    field contains an embedded quote or newline character (e.g. free-text
-    notes/comments fields) -- shifting columns and silently corrupting or
-    dropping individual records. This is invisible in Excel, which parses
-    quoted CSV structure correctly and never revealed the problem when
-    manually inspected. Fixed by reading with multiLine=True and explicit
-    quote/escape handling, matching Spark's proper CSV/RFC-4180 parsing.
+    Two regimes:
+
+    1. NORMAL CADENCE (unchanged from original): pools every folder in
+       the existing forward window, event_date=X through X+forward_window_days.
+       This is the ONLY thing that runs for any date where at least one
+       folder in that window exists -- zero added cost for daily-cadence
+       dates (March 2026 onward).
+
+    2. SPARSE HISTORICAL FALLBACK (new): for target dates where NOT A
+       SINGLE folder exists anywhere in the normal forward window --
+       confirmed pattern in Jan/Feb 2026, where delivery was irregular
+       and a single file could hold a month's worth of records, e.g.
+       event_date=2026-01-01/ containing records spanning most of
+       January -- expands outward in BOTH directions, day by day, until
+       it finds the nearest folder(s) that actually exist, capped at
+       max_search_days.
+
+    This does NOT add backward search to the normal-cadence case. The
+    one confirmed 2026-07-15 backward-filing anomaly was intentionally
+    NOT generalized into permanent backward search (single occurrence,
+    not a structural pattern) -- see engineering-learnings.md. This
+    fallback only triggers when the normal window finds absolutely
+    nothing, which the July 15 case does NOT qualify for (07-16's
+    folder exists and is within the normal window; the record just
+    happened to physically be filed in 07-14 instead).
     """
-    file_key = f"{DASHBOARD_PREFIX}/{DASHBOARD_FILE_MAP[survey_name]}"
-    df = (
-        spark.read
-            .option("header", True)
-            .option("multiLine", True)
-            .option("quote", '"')
-            .option("escape", '"')
-            .option("mode", "PERMISSIVE")
-            .csv(f"s3://{DASHBOARD_BUCKET}/{file_key}")
-    )
+    if not all_target_dates:
+        return {}
 
-    filtered = df.filter(
-        F.coalesce(
-            F.to_date(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), "M/d/yyyy H:mm"),
-            F.to_date(F.col(RAW_DASHBOARD_INVITATION_DATE_FIELD), "yyyy-MM-dd HH:mm:ss")
-        ) == F.lit(event_date)
-    )
+    existing_folders = set(list_event_date_partitions(RAW_BUCKET, RAW_PREFIX))
 
-    return filtered.select(RAW_DASHBOARD_CONTACT_ID_FIELD).distinct().count()
+    # --- Regime 1: normal forward window, exactly as before ---
+    folders_to_read = set()
+    dates_with_no_folder_in_window = []
+
+    for target_date in all_target_dates:
+        base = datetime.strptime(target_date, "%Y-%m-%d")
+        window_folders = [
+            (base + timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(0, forward_window_days + 1)
+        ]
+        matched = [f for f in window_folders if f in existing_folders]
+        if matched:
+            folders_to_read.update(matched)
+        else:
+            dates_with_no_folder_in_window.append(target_date)
+
+    # --- Regime 2: sparse historical fallback -- ONLY for dates that
+    #     found nothing at all in Regime 1 ---
+    if dates_with_no_folder_in_window:
+        logger.info(
+            f"{len(dates_with_no_folder_in_window)} date(s) found no folder in the "
+            f"normal {forward_window_days}-day window -- expanding search "
+            f"(sparse historical delivery period): {dates_with_no_folder_in_window}"
+        )
+        for target_date in dates_with_no_folder_in_window:
+            base = datetime.strptime(target_date, "%Y-%m-%d")
+            found = False
+            for offset in range(forward_window_days + 1, max_search_days + 1):
+                forward_candidate = (base + timedelta(days=offset)).strftime("%Y-%m-%d")
+                backward_candidate = (base - timedelta(days=offset)).strftime("%Y-%m-%d")
+                for candidate in (forward_candidate, backward_candidate):
+                    if candidate in existing_folders:
+                        folders_to_read.add(candidate)
+                        found = True
+                if found:
+                    break
+            if not found:
+                logger.warning(
+                    f"No Raw folder found within {max_search_days} days of "
+                    f"{target_date} in either direction."
+                )
+
+    logger.info(f"Reading {len(folders_to_read)} Raw delivery folder(s) once each, covering {len(all_target_dates)} target date(s).")
+
+    all_json_keys = []
+    for folder_date in sorted(folders_to_read):
+        all_json_keys.extend(_list_raw_json_keys_for_folder(folder_date))
+
+    if not all_json_keys:
+        logger.warning("No Raw files found across the entire target date range.")
+        return {}
+
+    logger.info(f"Found {len(all_json_keys)} total Raw file(s) to read once each.")
+
+    combined_df = None
+    target_dates_set = set(all_target_dates)
+
+    for key in all_json_keys:
+        raw_path = f"s3://{RAW_BUCKET}/{key}"
+        try:
+            raw_df = spark.read.option("multiLine", "true").json(raw_path)
+            tagged_df = (
+                raw_df
+                .withColumn("_invitation_date_str", F.substring(F.col(RAW_INVITATION_DATE_FIELD), 1, 10))
+                .filter(F.col(RAW_INVITATION_DATE_FIELD).isNotNull())
+                .filter(F.trim(F.col(RAW_INVITATION_DATE_FIELD)) != "")
+                .filter(F.col("_invitation_date_str").isin(list(target_dates_set)))
+                .withColumn("_survey_name_lower", F.lower(F.trim(F.col(RAW_SURVEY_TYPE_FIELD))))
+                .select(
+                    F.col(RAW_CONTACT_ID_FIELD).alias("_contact_id"),
+                    "_survey_name_lower",
+                    F.col("_invitation_date_str").alias("_event_date")
+                )
+            )
+            combined_df = tagged_df if combined_df is None else combined_df.unionByName(tagged_df)
+        except Exception as e:
+            logger.error(f"RAW READ FAILED for path={raw_path}: {e}")
+            raise
+
+    if combined_df is None:
+        return {}
+
+    distinct_df = combined_df.dropDuplicates(["_contact_id"])
+    rows = distinct_df.groupBy("_event_date", "_survey_name_lower").count().collect()
+    result = {(row["_event_date"], row["_survey_name_lower"]): row["count"] for row in rows}
+
+    logger.info(f"Built raw count lookup for {len(result)} (event_date, survey) combinations.")
+    return result
+
+
+
+-------------------------------------
+
+def list_event_date_partitions(bucket, prefix):
+    """Lists every existing event_date=YYYY-MM-DD/ partition folder name under a prefix."""
+    if not prefix.endswith("/"):
+        prefix += "/"
+    paginator = s3_client.get_paginator("list_objects_v2")
+    dates = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            folder_name = cp["Prefix"].rstrip("/").split("/")[-1]
+            if folder_name.startswith("event_date="):
+                dates.append(folder_name.replace("event_date=", ""))
+    return dates
+
+
+------------------------------
