@@ -13,67 +13,129 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 # =============================================================================
-# Fill in the survey label -> Curated S3 path for each survey you want to
-# check. SMS_REL is filled in from what we've already confirmed; add the
-# others (e.g. the two email/CSAT surveys) with their real curated_folder
-# values from SURVEY_CONFIGS in the production script.
-# =============================================================================
+def parse_flexible_date(col):
+    """
+    Parses a date column that may be stored in either of two known
+    coexisting formats seen across this pipeline's source data:
+    "M/d/yyyy H:mm" or "yyyy-MM-dd HH:mm:ss". Returns null only if
+    NEITHER format matches -- a genuine parse failure, not just a
+    format mismatch.
+    """
+    return F.coalesce(
+        F.to_date(col, "M/d/yyyy H:mm"),
+        F.to_date(col, "yyyy-MM-dd HH:mm:ss")
+    )
+
 CURATED_BUCKET = "psegli-datalakenonprodli-datalake-curated-dev"
 
 SURVEYS_TO_CHECK = {
     "SMS_REL": f"s3://{CURATED_BUCKET}/ccaas/survey_sms_web_relational/",
-    # "CUSTOMER_SAT_EMAIL": f"s3://{CURATED_BUCKET}/ccaas/<curated_folder_here>/",
-    # "CUSTOMER_REP_SAT_V2": f"s3://{CURATED_BUCKET}/ccaas/<curated_folder_here>/",
+    "SMS_TXN": f"s3://{CURATED_BUCKET}/ccaas/survey_sms_web_transactional/",
+    "API_REL": f"s3://{CURATED_BUCKET}/ccaas/survey_api_web_relational/",
+    "API_TXN": f"s3://{CURATED_BUCKET}/ccaas/survey_api_web_transactional/",
+    "CUSTOMER_REP_SAT_V2": f"s3://{CURATED_BUCKET}/ccaas/<curated_folder_here>/",
+    "CUSTOMER_SAT_EMAIL": f"s3://{CURATED_BUCKET}/ccaas/<curated_folder_here>/",
 }
 
+# =============================================================================
+# Read each survey, tag it with its own name, and union into ONE combined
+# DataFrame -- lets us do a single groupBy across all surveys at once
+# instead of six separate print blocks.
+# =============================================================================
+combined_df = None
+read_failures = []
+
 for survey_label, curated_path in SURVEYS_TO_CHECK.items():
-    print(f"\n=========================================================")
-    print(f"=== {survey_label} — gap between invitation_date and response_received_date ===")
-    print(f"=========================================================")
-
     try:
-        curated_df = spark.read.parquet(curated_path)
-    except Exception as e:
-        print(f"FAILED to read {curated_path}: {e}")
-        continue
-
-    gap_df = (
-        curated_df
-        .filter(F.col("invitation_date").isNotNull() & F.col("response_received_date").isNotNull())
-        .withColumn(
-            "gap_days",
-            F.datediff(
-                F.to_date(F.col("response_received_date")),
-                F.to_date(F.col("invitation_date"))
+        survey_df = (
+            spark.read.parquet(curated_path)
+            .filter(
+                F.col("invitation_date").isNotNull()
+                & (F.trim(F.col("invitation_date")) != "")
+                & F.col("response_received_date").isNotNull()
+                & (F.trim(F.col("response_received_date")) != "")
             )
+            .withColumn("survey_name", F.lit(survey_label))
+            .withColumn(
+                "gap_days",
+                F.datediff(
+                    parse_flexible_date(F.col("response_received_date")),
+                    parse_flexible_date(F.col("invitation_date"))
+                )
+            )
+            .select("survey_name", "contact_record_id", "invitation_date", "response_received_date", "gap_days")
         )
-    )
+        combined_df = survey_df if combined_df is None else combined_df.unionByName(survey_df)
+    except Exception as e:
+        print(f"FAILED to read {survey_label} at {curated_path}: {e}")
+        read_failures.append(survey_label)
 
-    total_rows = gap_df.count()
-    print(f"Total rows with both dates present: {total_rows}")
+if combined_df is None:
+    print("No surveys read successfully -- check paths above.")
+    job.commit()
+    sys.exit(0)
 
-    if total_rows == 0:
-        print("No rows to analyze -- check the S3 path and field names.")
+combined_df.cache()
+
+if read_failures:
+    print(f"\nWARNING: these surveys failed to read and are EXCLUDED below: {read_failures}\n")
+
+# =============================================================================
+# 1. Overall counts per survey: total rows checked vs. unparseable
+# =============================================================================
+print("=== Rows checked and parse failures, per survey ===")
+combined_df.groupBy("survey_name").agg(
+    F.count("*").alias("total_rows_both_fields_present"),
+    F.sum(F.when(F.col("gap_days").isNull(), 1).otherwise(0)).alias("unparseable_under_either_format"),
+    F.sum(F.when(F.col("gap_days").isNotNull(), 1).otherwise(0)).alias("successfully_parsed")
+).orderBy("survey_name").show(20, truncate=False)
+
+# =============================================================================
+# 2. Full gap_days distribution, per survey, in one combined table
+# =============================================================================
+print("\n=== gap_days distribution, per survey (invitation_date -> response_received_date) ===")
+combined_df.filter(F.col("gap_days").isNotNull()) \
+    .groupBy("survey_name", "gap_days") \
+    .count() \
+    .orderBy("survey_name", "gap_days") \
+    .show(100, truncate=False)
+
+# =============================================================================
+# 3. Summary stats per survey -- max, 99th/99.9th percentile, negative gaps
+# =============================================================================
+print("\n=== Summary stats per survey ===")
+parsed_df = combined_df.filter(F.col("gap_days").isNotNull())
+
+summary_rows = []
+for survey_label in SURVEYS_TO_CHECK:
+    survey_parsed = parsed_df.filter(F.col("survey_name") == survey_label)
+    count = survey_parsed.count()
+    if count == 0:
+        summary_rows.append((survey_label, 0, None, None, None, None))
         continue
+    max_gap = survey_parsed.agg(F.max("gap_days")).collect()[0][0]
+    p99 = survey_parsed.approxQuantile("gap_days", [0.99], 0.01)[0]
+    p999 = survey_parsed.approxQuantile("gap_days", [0.999], 0.001)[0]
+    neg_count = survey_parsed.filter(F.col("gap_days") < 0).count()
+    summary_rows.append((survey_label, count, max_gap, p99, p999, neg_count))
 
-    print("\n--- Distribution of gap_days (invitation_date -> response_received_date) ---")
-    gap_df.groupBy("gap_days").count().orderBy("gap_days").show(50)
+summary_df = spark.createDataFrame(
+    summary_rows,
+    ["survey_name", "parsed_row_count", "max_gap_days", "p99_gap_days", "p999_gap_days", "negative_gap_count"]
+)
+summary_df.orderBy("survey_name").show(20, truncate=False)
 
-    max_gap = gap_df.agg(F.max("gap_days")).collect()[0][0]
-    p99_gap = gap_df.approxQuantile("gap_days", [0.99], 0.01)[0]
-    p999_gap = gap_df.approxQuantile("gap_days", [0.999], 0.001)[0]
-    negative_gaps = gap_df.filter(F.col("gap_days") < 0).count()
-
-    print(f"\nMax gap observed: {max_gap} day(s)")
-    print(f"99th percentile gap: {p99_gap} day(s)")
-    print(f"99.9th percentile gap: {p999_gap} day(s)")
-    print(f"Rows with a NEGATIVE gap (response before invitation -- worth investigating if > 0): {negative_gaps}")
-
-    if negative_gaps > 0:
-        print("Sample of negative-gap rows (data quality check, not window sizing):")
-        gap_df.filter(F.col("gap_days") < 0).select(
-            "contact_record_id", "invitation_date", "response_received_date", "gap_days"
-        ).show(10, truncate=False)
+# =============================================================================
+# 4. Sample of any still-unparseable rows, across ALL surveys, in one place
+# =============================================================================
+still_unparseable = combined_df.filter(F.col("gap_days").isNull())
+unparseable_total = still_unparseable.count()
+print(f"\n=== Total unparseable rows across ALL surveys: {unparseable_total} ===")
+if unparseable_total > 0:
+    print("Sample (up to 15), showing which survey and the exact raw text:")
+    still_unparseable.select(
+        "survey_name", "contact_record_id", "invitation_date", "response_received_date"
+    ).show(15, truncate=False)
 
 # =============================================================================
 job.commit()
