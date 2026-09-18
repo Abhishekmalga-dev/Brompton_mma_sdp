@@ -1,96 +1,94 @@
-"""
-datalake-reconciliation-report-dev
-
-Reconciles record counts across Raw -> Curated -> Sentiment for all
-survey types, explains removed records via quarantine Parquet files, and
-flags any records that vanished WITHOUT a quarantine entry
-(unaccounted_count).
-
-Reads data DIRECTLY from S3 via boto3 + pyarrow -- no Starburst, no
-Athena, no query engine of any kind. Starburst only ever sees this
-pipeline's OUTPUT, via the Glue Crawler triggered at the end of this
-script; this script has zero awareness of Starburst.
-
-Parquet files are downloaded as raw bytes via boto3 and parsed in-memory
-with pyarrow.parquet -- deliberately NOT using pyarrow.fs.S3FileSystem,
-since that requires the pyarrow build to include optional S3/libcurl
-support, which isn't guaranteed present in every Lambda layer build
-(confirmed failure: "pyarrow installation is not built with support for
-'S3FileSystem'" on AWSSDKPandas-Python314). Downloading bytes via boto3
-and parsing with plain pyarrow.parquet avoids this dependency entirely.
-
-IMPORTANT (Raw counting): the Raw file at event_date=X/ is NOT limited
-to records from day X alone -- it contains a rolling ~7-day window
-(today's file includes the past week's records too). Counting every
-record in the file would badly overcount versus Curated, which
-correctly isolates just that day's records during curation. To match
-Curated's counting, each Raw record is only counted toward event_date
-if its own "Invitation Date" field falls on that exact day -- this is
-the field that actually anchors a record to a specific day, independent
-of which weekly file it happened to arrive in.
-
-IMPORTANT (schema): event_date and survey_name are written into the S3
-KEY PATH as Hive-style partitions (event_date=.../survey_name=.../), and
-are deliberately EXCLUDED from the JSON body itself. Including them in
-both places causes the Glue Crawler to register two columns with the
-same name (one from the partition, one from the file content), which
-Trino/Starburst rejects with "Table descriptor contains duplicate
-columns."
-
-Requires a Lambda layer with `pyarrow` installed (e.g. AWSSDKPandas) --
-not in the default Lambda runtime.
-
-Trigger: EventBridge rule on the Sentiment-writing Step Function's
-         "ExecutionSucceeded" event.
-Backfill: invoke directly with {"event_date": "YYYY-MM-DD"} in the payload
-          to reconcile a specific historical date instead of "latest".
-          For a full date range, invoke this Lambda once per date from
-          outside (manually via the Console Test button, or a small
-          driver script) -- do not pass a date range into this Lambda.
-"""
-
+import sys
 import boto3
 import json
 import logging
-import io
-import pyarrow.parquet as pq
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+import pyspark.sql.functions as F
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'ENV'])
+ENV = args.get('ENV', 'dev')
+
+
+def _get_optional_arg(name):
+    """
+    Manually checks sys.argv for an optional --NAME value, since
+    getResolvedOptions can't express "required if present, fine if
+    absent" -- it only knows "must be present."
+    """
+    flag = f"--{name}"
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1].strip()
+    return ""
+
+
+EVENT_DATE_PARAM = _get_optional_arg('EVENT_DATE')
+EVENT_DATES_S3_PATH_PARAM = _get_optional_arg('EVENT_DATES_S3_PATH')
+FORCE_RERUN_PARAM = _get_optional_arg('FORCE_RERUN').lower() == 'true'
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
 RAW_BUCKET = "psegli-datalakenonprodli-datalake-raw-dev"
-RAW_PREFIX = "ccaas/survey_api_json"  # + /event_date=YYYY-MM-DD/
+RAW_PREFIX = "ccaas/survey_api_json"
+
+RAW_LOOKBACK_WINDOW_DAYS = 7
 
 CURATED_BUCKET = "psegli-datalakenonprodli-datalake-curated-dev"
-CURATED_PREFIX_BASE = "ccaas"  # + /{curated_folder}/event_date=YYYY-MM-DD/
+CURATED_PREFIX_BASE = "ccaas"
 
-SENTIMENT_PREFIX_BASE = "sentiment_analysis/final"  # + /{sentiment_folder}/event_date=.../
+SENTIMENT_PREFIX_BASE = "sentiment_analysis/final"
+QUARANTINE_PREFIX_BASE = "sentiment_analysis/removed_records"
 
-QUARANTINE_PREFIX_BASE = "sentiment_analysis/removed_records"  # + /{quarantine_folder}/event_date=.../
+EVENT_DATES_BUCKET = "psegli-datalakenonprodli-datalake-temp-dev"
+EVENT_DATES_KEY = "sentiment_analysis/event_date/event_dates.json"
 
-# Confirmed against an actual Raw JSON record.
 RAW_SURVEY_TYPE_FIELD = "Survey Name"
 RAW_CONTACT_ID_FIELD = "Contact Record ID"
-
-# Anchors a Raw record to a specific day, since the Raw file itself
-# spans a rolling ~7-day window rather than just one day's records.
 RAW_INVITATION_DATE_FIELD = "Invitation Date"
+# CHANGED: reconciliation now counts by Response Received Date everywhere,
+# to match Feedback Manager's own filtering semantics, rather than
+# Invitation Date. Folder PLACEMENT in Raw/Curated/Sentiment is still
+# governed by Invitation Date upstream -- only the counting field changed.
+RAW_RESPONSE_RECEIVED_DATE_FIELD = "Response Received Date"
 
-# Curated/Sentiment/Quarantine Parquet layers use snake_case column names
-# (normalized by the curation job) -- different from the Raw JSON field
-# names above.
 CONTACT_RECORD_ID_COLUMN = "contact_record_id"
 REMOVAL_REASON_COLUMN = "removal_reason"
+# CHANGED: confirmed field names for the new counting field on each layer.
+CURATED_RESPONSE_RECEIVED_DATE_COLUMN = "response_received_date"
+SENTIMENT_RESPONSE_RECEIVED_DATE_COLUMN = "raw_response_received_date"
 
-# Full survey configuration, confirmed against the curation job's own
-# SURVEY_PREFIX_MAP. raw_survey_name is matched case-insensitively
-# against the Raw file's "Survey Name" field, matching the same
-# case-insensitive pattern the curation job itself already uses.
+DASHBOARD_BUCKET = "psegli-datalakenonprodli-datalake-temp-dev"
+DASHBOARD_PREFIX = "Sentiment_Analysis/dashboard_output"
+
+RAW_DASHBOARD_CONTACT_ID_FIELD = "raw_contact_record_id"
+RAW_DASHBOARD_INVITATION_DATE_FIELD = "raw_invitation_date"
+# CHANGED: dashboard's counting field, confirmed field name.
+RAW_DASHBOARD_RESPONSE_RECEIVED_DATE_FIELD = "raw_response_received_date"
+
+DASHBOARD_FILE_MAP = {
+    "IVR": "ivr_final_output_all_columns_dashboard.csv",
+    "API_REL": "api_web_relational_final_output_all_columns_dashboard.csv",
+    "API_TXN": "api_web_transactional_final_output_all_columns_dashboard.csv",
+    "SMS_REL": "sms_web_relational_final_output_all_columns_dashboard.csv",
+    "SMS_TXN": "sms_web_transactional_final_output_all_columns_dashboard.csv",
+}
+
 SURVEY_CONFIGS = [
     {
         "survey_name": "IVR",
@@ -150,191 +148,447 @@ SURVEY_CONFIGS = [
     },
 ]
 
-# Report storage
 S3_REPORT_BUCKET = "psegli-datalakenonprodli-datalake-curated-dev"
-S3_REPORT_PREFIX = "ccaas/Survey_Reconciliation_Report"
+S3_REPORT_PREFIX = "ccaas"
+REPORT_TABLE_FOLDER = "data_reconciliation_report"
 
 DYNAMODB_TABLE_NAME = "datalake-ccaas-reconciliation-dev"
-
-# Glue crawler that registers the S3 report output in the Data Catalog,
-# making it queryable in Starburst automatically.
 GLUE_CRAWLER_NAME = "datalake-reconciliation-report-dev"
-
-# =============================================================================
-# AWS CLIENTS
-# =============================================================================
 
 s3_client = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
-
+glue_client = boto3.client("glue")
 
 # =============================================================================
-# S3 / PARQUET / JSON HELPERS
+# EVENT DATE DISCOVERY
 # =============================================================================
 
-def list_event_date_partitions(bucket, prefix):
+def get_dates_from_control_file(s3_path):
+    """Reads event_dates.json (same control file the other Glue jobs use)."""
+    path = s3_path.replace("s3://", "")
+    bucket, key = path.split("/", 1)
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    content = json.loads(response["Body"].read())
+    date_lists = list(content.values())
+    return sorted(set(date_lists[0])) if date_lists else []
+
+
+def resolve_dates_to_process():
     """
-    Lists the event_date=YYYY-MM-DD partition folders directly under a
-    given S3 prefix, using a delimiter so we only get one level of
-    "folders" back (not every object recursively).
-    Returns a sorted list of date strings, e.g. ["2026-03-24", "2026-03-25"].
+    1. EVENT_DATE set          -> exactly that one date
+    2. EVENT_DATES_S3_PATH set -> every date in the control file
+    3. neither set             -> [None] (live mode)
+    """
+    if EVENT_DATE_PARAM:
+        return [EVENT_DATE_PARAM]
+    if EVENT_DATES_S3_PATH_PARAM:
+        return get_dates_from_control_file(EVENT_DATES_S3_PATH_PARAM)
+    return [None]
+
+# =============================================================================
+# S3 / PARQUET / CSV / JSON HELPERS
+# =============================================================================
+
+def partition_has_data(bucket, prefix_or_key):
+    """
+    Checks whether an S3 prefix (or exact key) has any objects, before
+    a Spark read. Works identically for a partition prefix or a single
+    flat file key.
+    """
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix_or_key, MaxKeys=1)
+    return response.get("KeyCount", 0) > 0
+
+
+def get_latest_event_date(bucket, prefix):
+    """
+    Returns the most recent event_date=YYYY-MM-DD partition folder under
+    a prefix, or None. Used only in live mode.
     """
     if not prefix.endswith("/"):
         prefix += "/"
-
     paginator = s3_client.get_paginator("list_objects_v2")
     dates = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
-        for common_prefix in page.get("CommonPrefixes", []):
-            folder_name = common_prefix["Prefix"].rstrip("/").split("/")[-1]
+        for cp in page.get("CommonPrefixes", []):
+            folder_name = cp["Prefix"].rstrip("/").split("/")[-1]
             if folder_name.startswith("event_date="):
                 dates.append(folder_name.replace("event_date=", ""))
-
-    return sorted(dates)
-
-
-def get_max_event_date(bucket, prefix):
-    """Returns the most recent event_date partition under a prefix, or None."""
-    dates = list_event_date_partitions(bucket, prefix)
-    return dates[-1] if dates else None
+    return sorted(dates)[-1] if dates else None
 
 
-def _list_parquet_keys(bucket, prefix):
-    """Lists all .parquet object keys under a given S3 prefix."""
+def _list_raw_json_keys_for_folder(folder_date):
+    """Lists all .json object keys under one Raw event_date=X/ folder."""
+    prefix = f"{RAW_PREFIX}/event_date={folder_date}/"
     paginator = s3_client.get_paginator("list_objects_v2")
     keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+    for page in paginator.paginate(Bucket=RAW_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
+            if obj["Key"].endswith(".json"):
                 keys.append(obj["Key"])
     return keys
 
 
-def _read_parquet_table(bucket, key, columns=None):
+def list_event_date_partitions(bucket, prefix):
+    """Lists every existing event_date=YYYY-MM-DD/ partition folder name under a prefix."""
+    if not prefix.endswith("/"):
+        prefix += "/"
+    paginator = s3_client.get_paginator("list_objects_v2")
+    dates = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            folder_name = cp["Prefix"].rstrip("/").split("/")[-1]
+            if folder_name.startswith("event_date="):
+                dates.append(folder_name.replace("event_date=", ""))
+    return dates
+
+
+def build_raw_counts_for_date_range(all_target_dates, forward_window_days=RAW_LOOKBACK_WINDOW_DAYS, max_search_days=120):
     """
-    Downloads a single Parquet file's bytes via boto3 and parses it with
-    pyarrow from memory. Avoids pyarrow.fs.S3FileSystem entirely, which
-    requires the pyarrow build to include optional S3/libcurl support --
-    not guaranteed present in every Lambda layer build. boto3 always
-    supports plain object downloads, so this works regardless of how
-    pyarrow itself was compiled.
+    Reads every Raw delivery folder covering the full target date range,
+    tags every record by its OWN Response Received Date (CHANGED from
+    Invitation Date -- see module-level note), and returns a lookup
+    keyed by (event_date, survey_name_lower) -> distinct_count.
+
+    Two regimes:
+
+    1. NORMAL CADENCE: pools every folder in a window SYMMETRIC around
+       each target date, event_date=X-forward_window_days through
+       X+forward_window_days.
+       CHANGED (2026-09-18): widened from forward-only to symmetric.
+       Folder placement is still keyed by Invitation Date, but the
+       counting field is now Response Received Date, and
+       response_received_date >= invitation_date by up to 6 days
+       (confirmed across all 6 surveys) while folder_date >=
+       invitation_date by up to forward_window_days -- so relative to a
+       target RESPONSE date, the record's folder can now be BEFORE that
+       date too, not just after. This is a structural consequence of
+       changing the counting field, not a generalization of the one-off
+       2026-07-15 backward-filing anomaly (that stays undone -- see
+       engineering-learnings.md).
+
+    2. SPARSE HISTORICAL FALLBACK (unchanged in shape): for target dates
+       where NOT A SINGLE folder exists anywhere in the normal window --
+       confirmed pattern in Jan/Feb 2026 sparse delivery -- expands
+       outward in both directions, day by day, until it finds the
+       nearest folder(s) that exist, capped at max_search_days.
     """
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    data = response["Body"].read()
-    return pq.read_table(io.BytesIO(data), columns=columns)
-
-
-def partition_has_data(bucket, prefix):
-    """Checks whether a specific S3 prefix has any objects at all."""
-    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
-    return response.get("KeyCount", 0) > 0
-
-
-def count_parquet_rows(bucket, prefix):
-    """Counts total rows across all Parquet files under an S3 prefix."""
-    keys = _list_parquet_keys(bucket, prefix)
-    if not keys:
-        return 0
-
-    total = 0
-    for key in keys:
-        table = _read_parquet_table(bucket, key)
-        total += table.num_rows
-    return total
-
-
-def read_parquet_column(bucket, prefix, column_name):
-    """
-    Reads a single column from all Parquet files under an S3 prefix.
-    Used to pull contact_record_id sets for the anti-join.
-    Returns an empty set if the prefix has no data.
-    """
-    keys = _list_parquet_keys(bucket, prefix)
-    if not keys:
-        return set()
-
-    values = set()
-    for key in keys:
-        table = _read_parquet_table(bucket, key, columns=[column_name])
-        values.update(table.column(column_name).to_pylist())
-    return values
-
-
-def read_parquet_columns_as_dict(bucket, prefix, key_column, value_column):
-    """
-    Reads two columns from Parquet files under a prefix and returns a
-    dict of key_column -> value_column. Used for quarantine tables to
-    build contact_record_id -> removal_reason lookups.
-    Returns an empty dict if the prefix has no data.
-    """
-    keys = _list_parquet_keys(bucket, prefix)
-    if not keys:
+    if not all_target_dates:
         return {}
 
-    result = {}
-    for key in keys:
-        table = _read_parquet_table(bucket, key, columns=[key_column, value_column])
-        ids = table.column(key_column).to_pylist()
-        vals = table.column(value_column).to_pylist()
-        result.update(dict(zip(ids, vals)))
+    existing_folders = set(list_event_date_partitions(RAW_BUCKET, RAW_PREFIX))
+
+    # --- Regime 1: symmetric window ---
+    folders_to_read = set()
+    dates_with_no_folder_in_window = []
+
+    for target_date in all_target_dates:
+        base = datetime.strptime(target_date, "%Y-%m-%d")
+        window_folders = [
+            (base + timedelta(days=offset)).strftime("%Y-%m-%d")
+            # CHANGED: was range(0, forward_window_days + 1) -- forward only.
+            for offset in range(-forward_window_days, forward_window_days + 1)
+        ]
+        matched = [f for f in window_folders if f in existing_folders]
+        if matched:
+            folders_to_read.update(matched)
+        else:
+            dates_with_no_folder_in_window.append(target_date)
+
+    # --- Regime 2: sparse historical fallback -- ONLY for dates that
+    #     found nothing at all in Regime 1 ---
+    if dates_with_no_folder_in_window:
+        logger.info(
+            f"{len(dates_with_no_folder_in_window)} date(s) found no folder in the "
+            f"normal +/-{forward_window_days}-day window -- expanding search "
+            f"(sparse historical delivery period): {dates_with_no_folder_in_window}"
+        )
+        for target_date in dates_with_no_folder_in_window:
+            base = datetime.strptime(target_date, "%Y-%m-%d")
+            found = False
+            for offset in range(forward_window_days + 1, max_search_days + 1):
+                forward_candidate = (base + timedelta(days=offset)).strftime("%Y-%m-%d")
+                backward_candidate = (base - timedelta(days=offset)).strftime("%Y-%m-%d")
+                for candidate in (forward_candidate, backward_candidate):
+                    if candidate in existing_folders:
+                        folders_to_read.add(candidate)
+                        found = True
+                if found:
+                    break
+            if not found:
+                logger.warning(
+                    f"No Raw folder found within {max_search_days} days of "
+                    f"{target_date} in either direction."
+                )
+
+    logger.info(f"Reading {len(folders_to_read)} Raw delivery folder(s) once each, covering {len(all_target_dates)} target date(s).")
+
+    all_json_keys = []
+    for folder_date in sorted(folders_to_read):
+        all_json_keys.extend(_list_raw_json_keys_for_folder(folder_date))
+
+    if not all_json_keys:
+        logger.warning("No Raw files found across the entire target date range.")
+        return {}
+
+    logger.info(f"Found {len(all_json_keys)} total Raw file(s) to read once each.")
+
+    combined_df = None
+    target_dates_set = set(all_target_dates)
+
+    for key in all_json_keys:
+        raw_path = f"s3://{RAW_BUCKET}/{key}"
+        try:
+            raw_df = spark.read.option("multiLine", "true").json(raw_path)
+            # CHANGED: tag by Response Received Date via the flexible
+            # parser (this field carries the same mixed-format risk
+            # confirmed on Curated), not a naive 10-char substring of
+            # Invitation Date.
+            tagged_df = (
+                raw_df
+                .filter(F.col(RAW_RESPONSE_RECEIVED_DATE_FIELD).isNotNull())
+                .filter(F.trim(F.col(RAW_RESPONSE_RECEIVED_DATE_FIELD)) != "")
+                .withColumn(
+                    "_event_date_str",
+                    F.date_format(_parse_invitation_date(F.col(RAW_RESPONSE_RECEIVED_DATE_FIELD)), "yyyy-MM-dd")
+                )
+                .filter(F.col("_event_date_str").isin(list(target_dates_set)))
+                .withColumn("_survey_name_lower", F.lower(F.trim(F.col(RAW_SURVEY_TYPE_FIELD))))
+                .select(
+                    F.col(RAW_CONTACT_ID_FIELD).alias("_contact_id"),
+                    "_survey_name_lower",
+                    F.col("_event_date_str").alias("_event_date")
+                )
+            )
+            combined_df = tagged_df if combined_df is None else combined_df.unionByName(tagged_df)
+        except Exception as e:
+            logger.error(f"RAW READ FAILED for path={raw_path}: {e}")
+            raise
+
+    if combined_df is None:
+        return {}
+
+    distinct_df = combined_df.dropDuplicates(["_contact_id"])
+    rows = distinct_df.groupBy("_event_date", "_survey_name_lower").count().collect()
+    result = {(row["_event_date"], row["_survey_name_lower"]): row["count"] for row in rows}
+
+    logger.info(f"Built raw count lookup for {len(result)} (event_date, survey) combinations.")
     return result
 
 
-def count_all_raw_survey_records(event_date):
+def count_all_raw_survey_records_single_date(event_date):
     """
-    Reads the Raw JSON file(s) for a given event_date ONCE, and counts
-    records for ALL survey types in a single pass -- rather than
-    re-reading and re-parsing the same files once per survey (7 reads of
-    identical data for one date).
+    Fallback for LIVE mode only, where dates aren't known upfront so the
+    bulk lookup can't be pre-built. Searches a window SYMMETRIC around
+    RAW_LOOKBACK_WINDOW_DAYS for just this one date, on demand, and tags
+    by Response Received Date -- same reasoning as
+    build_raw_counts_for_date_range above.
 
-    IMPORTANT: the Raw file at event_date=X/ is NOT limited to records
-    from day X alone -- it contains a rolling ~7-day window (today's
-    file includes the past week's records too). Counting every record
-    in the file would badly overcount versus Curated, which correctly
-    isolates just that day's records during curation.
-
-    To match Curated's counting, each record is only counted if its own
-    "Invitation Date" falls on the target event_date -- this is the
-    field that actually anchors a record to a specific day, independent
-    of which weekly file it happened to arrive in. Records with a
-    missing/blank Invitation Date are skipped entirely (not counted
-    toward any date), rather than guessed at.
-
-    Returns a dict: {raw_survey_name_lowercase: count}
+    Returns a dict: {raw_survey_name_lowercase: distinct_count}
     """
-    prefix = f"{RAW_PREFIX}/event_date={event_date}/"
-    paginator = s3_client.get_paginator("list_objects_v2")
+    base = datetime.strptime(event_date, "%Y-%m-%d")
+    folder_dates = [
+        (base + timedelta(days=offset)).strftime("%Y-%m-%d")
+        # CHANGED: was range(0, ... + 1) -- forward only.
+        for offset in range(-RAW_LOOKBACK_WINDOW_DAYS, RAW_LOOKBACK_WINDOW_DAYS + 1)
+    ]
 
-    counts = {}
+    json_keys = []
+    for folder_date in folder_dates:
+        json_keys.extend(_list_raw_json_keys_for_folder(folder_date))
 
-    for page in paginator.paginate(Bucket=RAW_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if not key.endswith(".json"):
-                continue
+    if not json_keys:
+        logger.warning(f"No Raw files found for event_date={event_date} across window {folder_dates}")
+        return {}
 
-            response = s3_client.get_object(Bucket=RAW_BUCKET, Key=key)
-            content = response["Body"].read().decode("utf-8")
-            records = json.loads(content)  # top-level is a flat JSON array
+    logger.info(f"event_date={event_date}: found {len(json_keys)} Raw file(s) across window")
 
-            for record in records:
-                invitation_date_raw = record.get(RAW_INVITATION_DATE_FIELD, "")
-                if not invitation_date_raw:
-                    continue
+    combined_df = None
+    for key in json_keys:
+        raw_path = f"s3://{RAW_BUCKET}/{key}"
+        try:
+            raw_df = spark.read.option("multiLine", "true").json(raw_path)
 
-                # "Invitation Date" is "YYYY-MM-DD HH:MM:SS" -- take just
-                # the date portion (first 10 chars) to compare against
-                # the target event_date, which is a plain "YYYY-MM-DD".
-                record_date = invitation_date_raw.strip()[:10]
-                if record_date != event_date:
-                    continue
+            filtered_df = (
+                raw_df
+                .filter(F.col(RAW_RESPONSE_RECEIVED_DATE_FIELD).isNotNull())
+                .filter(F.trim(F.col(RAW_RESPONSE_RECEIVED_DATE_FIELD)) != "")
+                .withColumn(
+                    "_event_date_str",
+                    F.date_format(_parse_invitation_date(F.col(RAW_RESPONSE_RECEIVED_DATE_FIELD)), "yyyy-MM-dd")
+                )
+                .filter(F.col("_event_date_str") == event_date)
+                .withColumn("_survey_name_lower", F.lower(F.trim(F.col(RAW_SURVEY_TYPE_FIELD))))
+                .select(
+                    F.col(RAW_CONTACT_ID_FIELD).alias("_contact_id"),
+                    "_survey_name_lower"
+                )
+            )
+            combined_df = filtered_df if combined_df is None else combined_df.unionByName(filtered_df)
+        except Exception as e:
+            logger.error(f"RAW READ FAILED for event_date={event_date}, path={raw_path}: {e}")
+            raise
 
-                survey_value = record.get(RAW_SURVEY_TYPE_FIELD, "")
-                key_lower = survey_value.strip().lower()
-                counts[key_lower] = counts.get(key_lower, 0) + 1
+    if combined_df is None:
+        return {}
 
-    return counts
+    distinct_df = combined_df.dropDuplicates(["_contact_id"])
+    rows = distinct_df.groupBy("_survey_name_lower").count().collect()
+    result = {row["_survey_name_lower"]: row["count"] for row in rows}
 
+    logger.info(f"event_date={event_date}: distinct survey_name keys/counts = {result}")
+    return result
+
+
+def _parse_invitation_date(date_col):
+    """
+    Normalizes a date column across every format variant we've
+    encountered or might reasonably encounter on this pipeline's data
+    (name kept for continuity -- used on Invitation Date originally,
+    now also reused for Response Received Date on every layer, since
+    the same mixed-format risk applies to both fields):
+      - "yyyy-MM-dd HH:mm:ss"   (e.g. 2026-08-07 05:42:39)
+      - "yyyy-MM-dd HH:mm"      (same, no seconds)
+      - "M/d/yyyy H:mm:ss"      (e.g. 8/7/2026 5:42:39)
+      - "M/d/yyyy H:mm"         (e.g. 8/7/2026 5:42, no seconds)
+      - "yyyy-MM-dd"            (date only, no time)
+      - "M/d/yyyy"              (date only, no time)
+    coalesce() tries each pattern in order and returns the first one
+    that successfully parses -- any row matching none of these returns
+    NULL, which is intentionally excluded by the isNotNull() filter
+    downstream rather than silently miscounted.
+    """
+    date_part = F.split(date_col, " ").getItem(0)
+    return F.coalesce(
+        F.to_date(date_col, "yyyy-MM-dd HH:mm:ss"),
+        F.to_date(date_col, "yyyy-MM-dd HH:mm"),
+        F.to_date(date_col, "M/d/yyyy H:mm:ss"),
+        F.to_date(date_col, "M/d/yyyy H:mm"),
+        F.to_date(date_part, "yyyy-MM-dd"),
+        F.to_date(date_part, "M/d/yyyy"),
+    )
+
+
+def count_dashboard_records(survey_name, event_date):
+    """
+    Reads the single, always-overwritten dashboard CSV for this survey,
+    filters by raw_response_received_date == event_date (CHANGED from
+    raw_invitation_date), and counts DISTINCT raw_contact_record_id.
+
+    CONFIRMED ROOT CAUSE (2026-09-15) of the ORIGINAL undercount bug:
+    the default CSV reader (no multiLine/quote/escape options) mis-parses
+    row boundaries whenever a field contains an embedded quote or newline
+    character -- shifting columns and silently corrupting or dropping
+    individual records. Invisible in Excel, which parses quoted CSV
+    structure correctly. Fixed by reading with multiLine=True and
+    explicit quote/escape handling, matching Spark's proper CSV/RFC-4180
+    parsing. That fix is unrelated to, and unaffected by, the field
+    change below.
+    """
+    file_key = f"{DASHBOARD_PREFIX}/{DASHBOARD_FILE_MAP[survey_name]}"
+    df = (
+        spark.read
+            .option("header", True)
+            .option("multiLine", True)
+            .option("quote", '"')
+            .option("escape", '"')
+            .option("mode", "PERMISSIVE")
+            .csv(f"s3://{DASHBOARD_BUCKET}/{file_key}")
+    )
+
+    # CHANGED: was RAW_DASHBOARD_INVITATION_DATE_FIELD with an inline
+    # 2-format coalesce; now uses the response-received field and the
+    # shared _parse_invitation_date() helper (6 formats).
+    filtered = df.filter(
+        _parse_invitation_date(F.col(RAW_DASHBOARD_RESPONSE_RECEIVED_DATE_FIELD)) == F.lit(event_date)
+    )
+
+    return filtered.select(RAW_DASHBOARD_CONTACT_ID_FIELD).distinct().count()
+
+
+def read_parquet_df(bucket, prefix):
+    """
+    Reads a Curated/Sentiment Parquet partition via Spark, restricted to
+    *.parquet files only, so stray non-Parquet files in the same folder
+    don't cause CANNOT_READ_FILE_FOOTER.
+    Returns None if the partition has no matching Parquet files.
+    """
+    if not partition_has_data(bucket, prefix):
+        return None
+
+    full_prefix = f"s3://{bucket}/{prefix}"
+    glob_path = full_prefix.rstrip("/") + "/*.parquet"
+    try:
+        return spark.read.parquet(glob_path)
+    except Exception as e:
+        logger.warning(f"No readable Parquet files found at {glob_path}: {e}")
+        return None
+
+
+def read_curated_or_sentiment_by_response_date(bucket, prefix_base, folder, event_date, response_date_column, window_days=RAW_LOOKBACK_WINDOW_DAYS):
+    """
+    NEW (2026-09-18): reads every event_date= partition within a
+    symmetric window_days window of the target date and filters to rows
+    whose OWN response_date_column matches event_date.
+
+    Required because Curated/Sentiment partitions are keyed by
+    Invitation Date (folder placement UNCHANGED), which can now diverge
+    from the counting field (Response Received Date) by up to 6 days in
+    either direction (confirmed across all 6 surveys, 2026-09-18) -- the
+    same class of gap Raw's window search already accounted for.
+    Previously these two layers did NO per-row date filtering at all
+    (count_df_rows() just counted every row physically in the
+    Invitation-Date-keyed partition); this closes that gap.
+
+    response_date_column differs by source: "response_received_date" on
+    Curated, "raw_response_received_date" on Sentiment -- confirmed
+    field names, pass explicitly rather than assuming they match.
+
+    Returns None if no partition in the window has any data at all.
+    """
+    base = datetime.strptime(event_date, "%Y-%m-%d")
+    combined_df = None
+
+    for offset in range(-window_days, window_days + 1):
+        candidate_date = (base + timedelta(days=offset)).strftime("%Y-%m-%d")
+        prefix = f"{prefix_base}/{folder}/event_date={candidate_date}/"
+        df = read_parquet_df(bucket, prefix)
+        if df is None:
+            continue
+
+        tagged = (
+            df
+            .filter(F.col(response_date_column).isNotNull())
+            .filter(_parse_invitation_date(F.col(response_date_column)) == F.lit(event_date))
+        )
+        combined_df = tagged if combined_df is None else combined_df.unionByName(tagged, allowMissingColumns=True)
+
+    if combined_df is None:
+        return None
+    return combined_df.dropDuplicates([CONTACT_RECORD_ID_COLUMN])
+
+
+def read_csv_df(bucket, prefix):
+    """
+    Reads quarantine (removed_records) data via Spark's CSV reader.
+    Returns None if the partition has no data.
+
+    NOTE -- open item, not yet changed: quarantine is still read from a
+    single fixed event_date= partition (Invitation-Date-keyed), not the
+    symmetric response-date window. If a record's true response date
+    lands outside its own Invitation-Date partition, its quarantine
+    removal_reason (if any) may not be found by the missing_ids lookup
+    in reconcile_active_survey. Flagged for follow-up, not addressed in
+    this change set.
+    """
+    if not partition_has_data(bucket, prefix):
+        return None
+
+    full_prefix = f"s3://{bucket}/{prefix}"
+    return spark.read.option("header", "true").csv(full_prefix)
+
+
+def count_df_rows(df):
+    return df.count() if df is not None else 0
 
 # =============================================================================
 # DYNAMODB HELPERS
@@ -343,9 +597,13 @@ def count_all_raw_survey_records(event_date):
 def already_reconciled(survey_name, event_date):
     """
     Checks whether this survey_name + event_date has already been
-    reconciled. Used to skip surveys with no new data (e.g., relational
-    surveys that don't run daily) instead of re-writing the same report.
+    reconciled. Bypassed entirely when FORCE_RERUN_PARAM is set, so a
+    forced run recomputes and overwrites existing rows instead of
+    skipping them.
     """
+    if FORCE_RERUN_PARAM:
+        return False
+
     table = dynamodb.Table(DYNAMODB_TABLE_NAME)
     response = table.get_item(
         Key={"event_date": event_date, "survey_type": survey_name}
@@ -354,7 +612,11 @@ def already_reconciled(survey_name, event_date):
 
 
 def write_dynamodb_summary(summary):
-    """Writes the lightweight summary row used for fast programmatic checks."""
+    """
+    put_item() overwrites any existing row for this key automatically --
+    no delete step needed before writing, whether this is a first-time
+    write or a forced recompute of an already-reconciled date.
+    """
     table = dynamodb.Table(DYNAMODB_TABLE_NAME)
     table.put_item(
         Item={
@@ -363,38 +625,37 @@ def write_dynamodb_summary(summary):
             "raw_count": summary["raw_count"],
             "curated_count": summary["curated_count"],
             "sentiment_count": summary["sentiment_count"],
+            "dashboard_count": summary["dashboard_count"],
             "removed_count": summary["removed_count"],
             "unaccounted_count": summary["unaccounted_count"],
             "raw_curated_mismatch": summary["raw_curated_mismatch"],
+            "dashboard_curated_mismatch": summary["dashboard_curated_mismatch"],
             "pipeline_status": summary.get("pipeline_status", "ACTIVE"),
-            "s3_report_path": summary["s3_report_path"],
             "generated_at": summary["generated_at"],
         }
     )
-
 
 # =============================================================================
 # CORE RECONCILIATION LOGIC
 # =============================================================================
 
 def reconcile_raw_only_survey(survey_config, event_date, raw_count):
-    """
-    Handles surveys that exist in Raw/Curated but haven't been wired into
-    Sentiment yet. Only raw_count and curated_count are real; everything
-    downstream is reported as N/A until the pipeline catches up.
-    """
     survey_name = survey_config["survey_name"]
     curated_folder = survey_config["curated_folder"]
 
-    curated_prefix = f"{CURATED_PREFIX_BASE}/{curated_folder}/event_date={event_date}/"
-    curated_count = count_parquet_rows(CURATED_BUCKET, curated_prefix)
+    # CHANGED: was a single fixed-partition read_parquet_df() call;
+    # now a symmetric response-date-windowed read.
+    curated_df = read_curated_or_sentiment_by_response_date(
+        CURATED_BUCKET, CURATED_PREFIX_BASE, curated_folder, event_date,
+        CURATED_RESPONSE_RECEIVED_DATE_COLUMN
+    )
+    curated_count = count_df_rows(curated_df)
 
     raw_curated_mismatch = raw_count != curated_count
     if raw_curated_mismatch:
         logger.warning(
             f"{survey_name} {event_date}: RAW/CURATED MISMATCH "
-            f"(raw={raw_count}, curated={curated_count}). "
-            f"This hop has no expected removal logic -- investigate."
+            f"(raw={raw_count}, curated={curated_count})."
         )
 
     generated_at = datetime.now(timezone.utc).isoformat()
@@ -405,9 +666,11 @@ def reconcile_raw_only_survey(survey_config, event_date, raw_count):
         "raw_count": raw_count,
         "curated_count": curated_count,
         "raw_curated_mismatch": raw_curated_mismatch,
-        "sentiment_count": "N/A",
-        "removed_count": "N/A",
-        "unaccounted_count": "N/A",
+        "sentiment_count": None,
+        "dashboard_count": None,
+        "dashboard_curated_mismatch": None,
+        "removed_count": None,
+        "unaccounted_count": None,
         "reason_breakdown": {},
         "pipeline_status": "RAW_ONLY",
         "generated_at": generated_at,
@@ -417,41 +680,77 @@ def reconcile_raw_only_survey(survey_config, event_date, raw_count):
     summary["s3_report_path"] = s3_path
     write_dynamodb_summary(summary)
 
-    logger.info(f"{survey_name}: RAW_ONLY, raw={raw_count}, curated={curated_count} for {event_date}")
     return summary
 
 
 def reconcile_active_survey(survey_config, event_date, raw_count):
-    """Runs the full reconciliation for an active (Sentiment-wired) survey."""
     survey_name = survey_config["survey_name"]
     curated_folder = survey_config["curated_folder"]
     sentiment_folder = survey_config["sentiment_folder"]
     quarantine_folder = survey_config["quarantine_folder"]
 
-    curated_prefix = f"{CURATED_PREFIX_BASE}/{curated_folder}/event_date={event_date}/"
-    sentiment_prefix = f"{SENTIMENT_PREFIX_BASE}/{sentiment_folder}/event_date={event_date}/"
-    quarantine_prefix = f"{QUARANTINE_PREFIX_BASE}/{quarantine_folder}/event_date={event_date}/"
+    # CHANGED: curated_df and sentiment_df now use the symmetric
+    # response-date-windowed read, each with its own confirmed column
+    # name, instead of a single fixed Invitation-Date partition.
+    curated_df = read_curated_or_sentiment_by_response_date(
+        CURATED_BUCKET, CURATED_PREFIX_BASE, curated_folder, event_date,
+        CURATED_RESPONSE_RECEIVED_DATE_COLUMN
+    )
+    sentiment_df = read_curated_or_sentiment_by_response_date(
+        CURATED_BUCKET, SENTIMENT_PREFIX_BASE, sentiment_folder, event_date,
+        SENTIMENT_RESPONSE_RECEIVED_DATE_COLUMN
+    )
 
-    curated_count = count_parquet_rows(CURATED_BUCKET, curated_prefix)
-    sentiment_count = count_parquet_rows(CURATED_BUCKET, sentiment_prefix)
+    # NOT changed -- see open item noted on read_csv_df().
+    quarantine_prefix = f"{QUARANTINE_PREFIX_BASE}/{quarantine_folder}/event_date={event_date}/"
+    quarantine_df = read_csv_df(CURATED_BUCKET, quarantine_prefix)
+
+    curated_count = count_df_rows(curated_df)
+    sentiment_count = count_df_rows(sentiment_df)
+    dashboard_count = count_dashboard_records(survey_name, event_date)
 
     raw_curated_mismatch = raw_count != curated_count
     if raw_curated_mismatch:
         logger.warning(
             f"{survey_name} {event_date}: RAW/CURATED MISMATCH "
-            f"(raw={raw_count}, curated={curated_count}). "
-            f"This hop has no expected removal logic -- investigate."
+            f"(raw={raw_count}, curated={curated_count})."
         )
 
-    # --- Anti-join: which contact_record_ids are in Curated but not Sentiment ---
-    curated_ids = read_parquet_column(CURATED_BUCKET, curated_prefix, CONTACT_RECORD_ID_COLUMN)
-    sentiment_ids = read_parquet_column(CURATED_BUCKET, sentiment_prefix, CONTACT_RECORD_ID_COLUMN)
-    missing_ids = curated_ids - sentiment_ids
-
-    # --- Explain the missing IDs via quarantine ---
-    quarantine_reasons = read_parquet_columns_as_dict(
-        CURATED_BUCKET, quarantine_prefix, CONTACT_RECORD_ID_COLUMN, REMOVAL_REASON_COLUMN
+    dashboard_curated_mismatch = (
+        dashboard_count is not None and dashboard_count != curated_count
     )
+    if dashboard_curated_mismatch:
+        logger.warning(
+            f"{survey_name} {event_date}: DASHBOARD/CURATED MISMATCH "
+            f"(dashboard={dashboard_count}, curated={curated_count})."
+        )
+
+    if curated_df is not None and sentiment_df is not None:
+        missing_ids_df = (
+            curated_df.select(CONTACT_RECORD_ID_COLUMN).distinct()
+            .subtract(sentiment_df.select(CONTACT_RECORD_ID_COLUMN).distinct())
+        )
+        missing_ids = [row[CONTACT_RECORD_ID_COLUMN] for row in missing_ids_df.collect()]
+    elif curated_df is not None:
+        missing_ids = [
+            row[CONTACT_RECORD_ID_COLUMN]
+            for row in curated_df.select(CONTACT_RECORD_ID_COLUMN).distinct().collect()
+        ]
+    else:
+        missing_ids = []
+
+    if quarantine_df is not None and missing_ids:
+        quarantine_rows = (
+            quarantine_df
+            .select(CONTACT_RECORD_ID_COLUMN, REMOVAL_REASON_COLUMN)
+            .filter(F.col(CONTACT_RECORD_ID_COLUMN).isin(missing_ids))
+            .collect()
+        )
+        quarantine_reasons = {
+            row[CONTACT_RECORD_ID_COLUMN]: row[REMOVAL_REASON_COLUMN] for row in quarantine_rows
+        }
+    else:
+        quarantine_reasons = {}
 
     removed_count = len(missing_ids)
     unaccounted_ids = [rid for rid in missing_ids if rid not in quarantine_reasons]
@@ -471,6 +770,8 @@ def reconcile_active_survey(survey_config, event_date, raw_count):
         "curated_count": curated_count,
         "raw_curated_mismatch": raw_curated_mismatch,
         "sentiment_count": sentiment_count,
+        "dashboard_count": dashboard_count,
+        "dashboard_curated_mismatch": dashboard_curated_mismatch,
         "removed_count": removed_count,
         "unaccounted_count": unaccounted_count,
         "reason_breakdown": reason_breakdown,
@@ -484,47 +785,35 @@ def reconcile_active_survey(survey_config, event_date, raw_count):
     if unaccounted_count > 0:
         write_anomaly_detail_to_s3(survey_name, event_date, unaccounted_ids, generated_at)
         logger.warning(
-            f"{survey_name} {event_date}: {unaccounted_count} records missing "
-            f"with NO quarantine explanation. See anomaly detail report."
+            f"{survey_name} {event_date}: {unaccounted_count} records unaccounted for."
         )
 
     write_dynamodb_summary(summary)
-
     return summary
 
 
 def reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date):
-    """
-    Resolves which event_date to reconcile for this survey, checks the
-    already-reconciled skip condition, then dispatches to the active or
-    raw-only reconciliation path.
-    Returns None if skipped (no new data, or already done).
-    """
     survey_name = survey_config["survey_name"]
     curated_folder = survey_config["curated_folder"]
     sentiment_active = survey_config["sentiment_pipeline_active"]
 
-    # Date resolution: active surveys resolve from Sentiment's own latest
-    # partition; raw-only surveys resolve from Curated instead, since
-    # Sentiment has no data for them at all.
-    if sentiment_active:
-        date_source_prefix = f"{SENTIMENT_PREFIX_BASE}/{survey_config['sentiment_folder']}"
-    else:
-        date_source_prefix = f"{CURATED_PREFIX_BASE}/{curated_folder}"
-
     if event_date_override:
         event_date = event_date_override
     else:
-        event_date = get_max_event_date(CURATED_BUCKET, date_source_prefix)
+        if sentiment_active:
+            date_source_prefix = f"{SENTIMENT_PREFIX_BASE}/{survey_config['sentiment_folder']}"
+        else:
+            date_source_prefix = f"{CURATED_PREFIX_BASE}/{curated_folder}"
+        event_date = get_latest_event_date(CURATED_BUCKET, date_source_prefix)
         if event_date is None:
             logger.info(f"{survey_name}: no data found under {date_source_prefix}, skipping.")
             return None
 
-    if not event_date_override and already_reconciled(survey_name, event_date):
+    if already_reconciled(survey_name, event_date):
         logger.info(f"{survey_name}: {event_date} already reconciled, skipping.")
         return None
 
-    logger.info(f"{survey_name}: reconciling event_date={event_date}")
+    logger.info(f"{survey_name}: reconciling event_date={event_date}" + (" [FORCE_RERUN]" if FORCE_RERUN_PARAM else ""))
 
     raw_counts = get_raw_counts_for_date(event_date)
     raw_count = raw_counts.get(survey_config["raw_survey_name"].strip().lower(), 0)
@@ -534,54 +823,28 @@ def reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date
     else:
         return reconcile_raw_only_survey(survey_config, event_date, raw_count)
 
-
 # =============================================================================
 # OUTPUT WRITERS
 # =============================================================================
 
 def write_summary_to_s3(summary):
-    """
-    Writes the daily summary as JSON to S3, Hive-partitioned by event_date
-    and survey_name so a Glue crawler picks these up as partition columns.
-
-    IMPORTANT: event_date and survey_name are deliberately EXCLUDED from
-    the JSON body itself. They're already encoded in the S3 path via
-    Hive-style partitioning (event_date=.../survey_name=.../), and the
-    crawler infers them as partition columns from the path automatically.
-    Including them again inside the JSON body causes the crawler to
-    register two columns with the same name (one from the partition,
-    one from the file content), which Trino/Starburst rejects with
-    "Table descriptor contains duplicate columns."
-
-    Active and raw-only surveys go to SEPARATE prefixes because their
-    schemas differ (raw-only has "N/A" strings for sentiment/removed/
-    unaccounted counts, active surveys have real integers). Mixing them
-    would make the crawler infer STRING for those columns everywhere,
-    breaking numeric queries (SUM/AVG/comparisons) on the active surveys.
-    """
-    is_active = summary["pipeline_status"] == "ACTIVE"
-    subfolder = "summary_active" if is_active else "summary_raw_only"
-
     key = (
-        f"{S3_REPORT_PREFIX}/{subfolder}/"
+        f"{S3_REPORT_PREFIX}/{REPORT_TABLE_FOLDER}/"
         f"event_date={summary['event_date']}/"
         f"survey_name={summary['survey_name']}/"
         f"report.json"
     )
 
-    # Flatten reason_breakdown (dict with variable keys per day) into a
-    # fixed-shape array of {reason, count} objects, so the crawler infers
-    # a stable schema regardless of which specific reasons show up.
-    reason_breakdown_list = [
-        {"removal_reason": reason, "record_count": count}
-        for reason, count in summary.get("reason_breakdown", {}).items()
-    ]
+    reason_breakdown_source = summary.get("reason_breakdown", {})
+    if reason_breakdown_source:
+        reason_breakdown_str = ", ".join(
+            f"{reason}: {count}" for reason, count in reason_breakdown_source.items()
+        )
+    else:
+        reason_breakdown_str = "NONE"
 
     record = dict(summary)
-    record["reason_breakdown"] = reason_breakdown_list
-
-    # Remove the partition-carried fields from the JSON body itself --
-    # see docstring above for why.
+    record["reason_breakdown"] = reason_breakdown_str
     record.pop("event_date", None)
     record.pop("survey_name", None)
 
@@ -591,25 +854,18 @@ def write_summary_to_s3(summary):
         Body=json.dumps(record, default=str),
         ContentType="application/json",
     )
+
     return f"s3://{S3_REPORT_BUCKET}/{key}"
 
 
 def write_anomaly_detail_to_s3(survey_name, event_date, unaccounted_ids, generated_at):
-    """
-    Writes record-level detail ONLY when something is genuinely
-    unaccounted for. Keeps the summary tables lean on normal days.
-
-    event_date and survey_name are excluded from the JSON body for the
-    same reason as write_summary_to_s3() -- they're already encoded in
-    the S3 partition path, and duplicating them in the body causes
-    crawler schema conflicts.
-    """
     key = (
         f"{S3_REPORT_PREFIX}/anomaly_detail/"
         f"event_date={event_date}/"
         f"survey_name={survey_name}/"
         f"detail.json"
     )
+
     detail = {
         "generated_at": generated_at,
         "unaccounted_contact_record_ids": unaccounted_ids,
@@ -623,107 +879,80 @@ def write_anomaly_detail_to_s3(survey_name, event_date, unaccounted_ids, generat
 
 
 def trigger_glue_crawler():
-    """
-    Kicks off the Glue crawler after this run finishes, so new partitions
-    show up in Starburst automatically. This script never writes to
-    Starburst directly -- the crawler handles catalog registration.
-    Matches the existing crawler-start pattern used elsewhere in this
-    project (e.g. datalake-crw-*-crawler-dev Lambdas).
-
-    NOTE: CrawlerRunningException is treated as a non-fatal skip, since
-    the reports above have already written successfully by this point --
-    an overlapping crawler run is a scheduling detail, not a
-    reconciliation failure.
-    """
     if not GLUE_CRAWLER_NAME:
         return
-
-    client = boto3.client('glue')
-
     try:
-        client.start_crawler(
-            Name=GLUE_CRAWLER_NAME
-        )
-    except client.exceptions.CrawlerRunningException:
+        glue_client.start_crawler(Name=GLUE_CRAWLER_NAME)
+        logger.info(f"Started Glue crawler: {GLUE_CRAWLER_NAME}")
+    except glue_client.exceptions.CrawlerRunningException:
         logger.info(f"Glue crawler {GLUE_CRAWLER_NAME} already running, skipping trigger.")
-        return
     except Exception as e:
-        logger.info("ERROR running the lambda script - {}... Please check...".format("start-crawler"))
-        logger.info("error starting crawler")
-        logger.info("ERROR is the following - {}... Please check...".format(e))
-        raise e
-
-    logger.info(f"Started Glue crawler: {GLUE_CRAWLER_NAME}")
-
+        logger.error(f"Failed to start Glue crawler: {e}")
+        raise
 
 # =============================================================================
-# LAMBDA HANDLER
+# MAIN
 # =============================================================================
 
-def lambda_handler(event, context):
-    """
-    event (optional, for backfill):
-        {
-            "event_date": "2026-03-24",
-            "survey_names": ["API_TXN", "IVR"]   # optional, defaults to all
-        }
-    Live invocations (via EventBridge) pass no meaningful payload --
-    each survey resolves its own latest event_date independently.
-    """
-    event = event or {}
-    event_date_override = event.get("event_date")
-    requested_surveys = event.get("survey_names")
-
-    configs_to_run = SURVEY_CONFIGS
-    if requested_surveys:
-        configs_to_run = [
-            c for c in SURVEY_CONFIGS if c["survey_name"] in requested_surveys
-        ]
-
-    # Raw is read ONCE per event_date, not once per survey. In a live run
-    # different surveys may resolve different "latest" dates (relational
-    # surveys don't run daily), so we don't know the full set of dates
-    # up front -- we cache results per date as we discover them instead.
-    raw_counts_cache = {}
-
-    def get_raw_counts_for_date(event_date):
-        if event_date not in raw_counts_cache:
-            raw_counts_cache[event_date] = count_all_raw_survey_records(event_date)
-        return raw_counts_cache[event_date]
-
-    results = []
-    skipped = []
-    errors = []
-
-    for survey_config in configs_to_run:
-        survey_name = survey_config["survey_name"]
-        try:
-            summary = reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date)
-            if summary is None:
-                skipped.append(survey_name)
-            else:
-                results.append(summary)
-        except Exception as e:
-            logger.error(f"Reconciliation FAILED for {survey_name}: {e}")
-            errors.append({"survey_name": survey_name, "error": str(e)})
-            continue
-
+def main():
+    dates_to_process = resolve_dates_to_process()
     logger.info(
-        f"Reconciliation complete. "
-        f"Succeeded: {len(results)}, Skipped: {len(skipped)}, Failed: {len(errors)}"
+        f"Processing {len(dates_to_process)} date(s): "
+        f"FORCE_RERUN={FORCE_RERUN_PARAM}"
     )
 
-    if results:
+    is_live_mode = dates_to_process == [None]
+
+    if is_live_mode:
+        raw_counts_cache = {}
+
+        def get_raw_counts_for_date(event_date):
+            if event_date not in raw_counts_cache:
+                raw_counts_cache[event_date] = count_all_raw_survey_records_single_date(event_date)
+            return raw_counts_cache[event_date]
+    else:
+        raw_counts_lookup = build_raw_counts_for_date_range(dates_to_process)
+
+        def get_raw_counts_for_date(event_date):
+            return {
+                survey_key: count
+                for (date_key, survey_key), count in raw_counts_lookup.items()
+                if date_key == event_date
+            }
+
+    total_reconciled = 0
+    total_skipped = 0
+    total_errors = 0
+
+    for i, event_date_override in enumerate(dates_to_process, 1):
+        logger.info(f"[{i}/{len(dates_to_process)}] event_date_override={event_date_override}")
+
+        for survey_config in SURVEY_CONFIGS:
+            survey_name = survey_config["survey_name"]
+            try:
+                summary = reconcile_survey(survey_config, event_date_override, get_raw_counts_for_date)
+                if summary is None:
+                    total_skipped += 1
+                else:
+                    total_reconciled += 1
+            except Exception as e:
+                logger.error(f"FAILED: {survey_name} on {event_date_override}: {e}")
+                total_errors += 1
+                continue
+
+    logger.info(
+        f"Reconciliation complete. Reconciled: {total_reconciled}, "
+        f"Skipped: {total_skipped}, Errors: {total_errors}"
+    )
+
+    if total_reconciled > 0:
         trigger_glue_crawler()
 
-    response = {
-        "statusCode": 200 if not errors else 500,
-        "reconciled": [r["survey_name"] for r in results],
-        "skipped": skipped,
-        "errors": errors,
-    }
+    job.commit()
 
-    if errors:
-        raise RuntimeError(f"Partial reconciliation failure: {json.dumps(errors)}")
+    if total_errors > 0:
+        raise RuntimeError(f"{total_errors} reconciliation(s) failed. Check job logs.")
 
-    return response
+
+if __name__ == "__main__":
+    main()
